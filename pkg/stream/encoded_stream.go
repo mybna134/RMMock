@@ -14,13 +14,14 @@ func StartEncodedStream[T interface{ int | string }](source T, wg *sync.WaitGrou
 	logrus.Info("成功连接到UDP服务器")
 	defer conn.Close()
 
+
 	stream := GetOpencvVideoStream(source)
 	defer stream.Close()
 	streamParam := GetOpenCVCaptureParam(stream)
 	logrus.Debugf("视频分辨率: %dx%d, FPS: %.2f", streamParam.frameWidth, streamParam.frameHeight, streamParam.fps)
 
 	// 创建HEVC编码器
-	encoder, err := FFmpegEncoderFactory(EncoderConfig{
+	encoder, err := NewX265Encoder(EncoderConfig{
 		Width:         streamParam.frameWidth,
 		Height:        streamParam.frameHeight,
 		FPS:           streamParam.fps,
@@ -67,6 +68,7 @@ func StartEncodedStream[T interface{ int | string }](source T, wg *sync.WaitGrou
 
 		// 如果编码器缓冲中，跳过
 		if len(encodedData) == 0 {
+			println("2")
 			continue
 		}
 
