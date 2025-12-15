@@ -1,19 +1,20 @@
 package stream
 
 import (
+	"sync"
+	"sync/atomic"
+
 	"github.com/sirupsen/logrus"
 	"gocv.io/x/gocv"
-	"sync"
 )
 
 // StartEncodedStream 启动带HEVC编码的视频流
-func StartEncodedStream[T interface{ int | string }](source T, wg *sync.WaitGroup) {
+func StartEncodedStream[T interface{ int | string }](source T, wg *sync.WaitGroup,  cls *atomic.Bool) {
 	defer wg.Done()
 
 	conn := GetUDPConn()
 	logrus.Info("成功连接到UDP服务器")
 	defer conn.Close()
-
 
 	stream := GetOpencvVideoStream(source)
 	defer stream.Close()
@@ -37,7 +38,7 @@ func StartEncodedStream[T interface{ int | string }](source T, wg *sync.WaitGrou
 
 	// 获取并发送SPS/PPS头
 	headers, err := encoder.GetHeaders()
-	if err != nil {
+	if err == nil {
 		logrus.Warnf("无法获取编码器头: %v", err)
 	} else if len(headers) > 0 {
 		logrus.Debugf("发送编码器头 (%d 字节)", len(headers))
@@ -48,7 +49,8 @@ func StartEncodedStream[T interface{ int | string }](source T, wg *sync.WaitGrou
 	defer frame.Close()
 
 	frameID := uint16(0)
-	for {
+
+	for !cls.Load() {
 		if ok := stream.Read(&frame); !ok {
 			logrus.Error("无法读取摄像头帧")
 			break
@@ -68,19 +70,18 @@ func StartEncodedStream[T interface{ int | string }](source T, wg *sync.WaitGrou
 
 		// 如果编码器缓冲中，跳过
 		if len(encodedData) == 0 {
-			println("2")
 			continue
 		}
 
-		logrus.Debugf("帧 %d 编码完成，大小: %d 字节（原始: %d 字节）",
-			frameID, len(encodedData), len(frame.ToBytes()))
+		// logrus.Debugf("帧 %d 编码完成，大小: %d 字节（原始: %d 字节）",
+		// 	frameID, len(encodedData), len(frame.ToBytes()))
 
 		SendPacket(conn, encodedData, frameID)
+		// logrus.Debugf("Packed Sended")
 		frameID = (frameID + 1) % 65535
 
-		window := gocv.NewWindow("Encoded Camera Feed")
-		window.IMShow(frame)
-		if window.WaitKey(1) >= 0 {
+		// cha <- frame
+		if cls.Load() {
 			break
 		}
 	}
@@ -93,4 +94,5 @@ func StartEncodedStream[T interface{ int | string }](source T, wg *sync.WaitGrou
 		logrus.Debug("发送刷新数据: %d 字节", len(flushedData))
 	}
 	logrus.Debug("编码流传输完成")
+	// close(cha)
 }

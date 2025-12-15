@@ -1,13 +1,14 @@
 package referee
 
 import (
-	"github.com/sirupsen/logrus"
 	"log"
 	"log/slog"
 	"os"
 	"os/signal"
 	"sync"
 	"syscall"
+
+	"github.com/sirupsen/logrus"
 
 	mqtt "github.com/mochi-mqtt/server/v2"
 	"github.com/mochi-mqtt/server/v2/hooks/auth"
@@ -28,8 +29,8 @@ func StartMqttServer(wg *sync.WaitGroup) {
 		done <- true
 	}()
 
-	slogLogger := slog.New(sloglogrus.Option{Logger: logrus.New()}.NewLogrusHandler())
-	server = mqtt.New(&mqtt.Options{Logger: slogLogger, InlineClient: true})
+	slogLogger := slog.New(sloglogrus.Option{Logger: logrus.New(), }.NewLogrusHandler())
+	server = mqtt.New(&mqtt.Options{Logger: slogLogger, InlineClient: false})
 	_ = server.AddHook(new(auth.AllowHook), nil)
 	tcp := listeners.NewTCP(listeners.Config{ID: "t1", Address: ":3333"})
 	err := server.AddListener(tcp)

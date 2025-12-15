@@ -2,12 +2,14 @@ package stream
 
 import (
 	"encoding/binary"
-	"github.com/sirupsen/logrus"
 	"net"
+
+	"github.com/sirupsen/logrus"
 )
 
 func GetUDPConn() *net.UDPConn {
-	serverAddr, err := net.ResolveUDPAddr("udp", "0.0.0.0:3334")
+	// "172.17.0.2:3334"
+	serverAddr, err := net.ResolveUDPAddr("udp", "172.17.0.2:3334")
 	if err != nil {
 		logrus.Fatalf("无法解析服务器地址: %v", err)
 	}
@@ -19,13 +21,12 @@ func GetUDPConn() *net.UDPConn {
 	return conn
 }
 
-func PacketFactory(frameID, sliceID uint16, sliceData []byte) []byte {
+func PacketFactory(frameID, sliceID uint16, frameSize uint32,sliceData []byte) []byte {
 	packet := make([]byte, 8+len(sliceData))
-	sliceSize := uint32(len(sliceData))
 
 	binary.BigEndian.PutUint16(packet[0:2], frameID)
 	binary.BigEndian.PutUint16(packet[2:4], sliceID)
-	binary.BigEndian.PutUint32(packet[4:8], sliceSize)
+	binary.BigEndian.PutUint32(packet[4:8], frameSize)
 	copy(packet[8:], sliceData)
 
 	return packet
@@ -41,6 +42,7 @@ func SendPacket(conn *net.UDPConn, encodedData []byte, frameID uint16) {
 
 	// 发送每个切片
 	for sliceID := uint16(0); sliceID < uint16(totalSlices); sliceID++ {
+		// logrus.Debugf("尝试发送切片%d", sliceID)
 		start := int(sliceID) * packetSize
 		end := start + packetSize
 		if end > len(encodedData) {
@@ -48,12 +50,12 @@ func SendPacket(conn *net.UDPConn, encodedData []byte, frameID uint16) {
 		}
 
 		// 通过UDP发送数据包到服务器
-		packet := PacketFactory(frameID, sliceID, encodedData[start:end])
+		packet := PacketFactory(frameID, sliceID, uint32(len(encodedData)),encodedData[start:end])
 		_, err := conn.Write(packet)
 		if err != nil {
-			logrus.Errorf("发送切片失败: %v", err)
+			// logrus.Errorf("发送切片失败: %v", err)
 			continue
 		}
-		logrus.Debugf("发送切片%d", sliceID)
+		// logrus.Debugf("发送切片%d", sliceID)
 	}
 }
