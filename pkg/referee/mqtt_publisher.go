@@ -1,33 +1,5799 @@
 package referee
 
 import (
+	"bufio"
+	"fmt"
+	"math/rand"
+	"os"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
 	"github.com/sirupsen/logrus"
 	"github.com/stydxm/RMMock/pkg/rmcp"
 	"google.golang.org/protobuf/proto"
-	"time"
 )
 
-func Publish() {
-	epoch := 0
-	initTime := time.Now().Unix()
+// 比赛阶段定义
+const (
+	StageNotStarted   = 0 // 未开始比赛
+	StagePreparation  = 1 // 准备阶段
+	StageRefereeCheck = 2 // 十五秒裁判系统自检阶段
+	StageCountdown    = 3 // 五秒倒计时
+	StageBattle       = 4 // 比赛中
+	StageCalculating  = 5 // 比赛结算中
+)
+
+// 各阶段持续时间（秒）
+var stageDurations = map[uint32]int32{
+	StageNotStarted:   0,   // 未开始比赛(需手动切换)
+	StagePreparation:  300, // 5分钟准备阶段
+	StageRefereeCheck: 15,  // 15秒裁判系统自检
+	StageCountdown:    5,   // 5秒倒计时
+	StageBattle:       420, // 7分钟比赛
+	StageCalculating:  10,  // 10秒结算
+}
+
+// GameSimulator 比赛状态模拟器
+type GameSimulator struct {
+	mu                sync.RWMutex
+	currentRound      uint32
+	totalRounds       uint32
+	redScore          uint32
+	blueScore         uint32
+	currentStage      uint32
+	stageStartTime    time.Time
+	isPaused          bool
+	pauseStartTime    time.Time
+	totalPausedTime   int32
+	rand              *rand.Rand
+	shouldStop        bool
+
+	// GlobalUnitStatus 相关字段
+	baseHealth        uint32
+	baseStatus        uint32
+	baseShield        uint32
+	outpostHealth     uint32
+	outpostStatus     uint32
+	robotHealth       []uint32
+	robotBullets      []int32
+	totalDamageRed    uint32
+	totalDamageBlue   uint32
+
+	// GlobalLogisticsStatus 相关字段
+	remainingEconomy      uint32
+	totalEconomyObtained  uint64
+	techLevel             uint32
+	encryptionLevel       uint32
+
+	// RobotModuleStatus 相关字段
+	powerManager       uint32
+	rfid               uint32
+	lightStrip         uint32
+	smallShooter       uint32
+	bigShooter         uint32
+	uwb                uint32
+	armor              uint32
+	videoTransmission  uint32
+	capacitor          uint32
+	mainController     uint32
+
+	// RobotRespawnStatus 相关字段
+	isPendingRespawn       bool
+	totalRespawnProgress   uint32
+	currentRespawnProgress uint32
+	canFreeRespawn         bool
+	goldCostForRespawn     uint32
+	canPayForRespawn       bool
+	respawnTicker          *time.Ticker
+	respawnStopChan        chan bool
+
+	// RobotInjuryStat 相关字段
+	injuryTotalDamage           uint32
+	injuryCollisionDamage       uint32
+	injurySmallProjectileDamage uint32
+	injuryLargeProjectileDamage uint32
+	injuryDartSplashDamage      uint32
+	injuryModuleOfflineDamage   uint32
+	injuryWifiOfflineDamage     uint32
+	injuryPenaltyDamage         uint32
+	injuryServerKillDamage      uint32
+	injuryKillerId              uint32
+
+	// RobotStaticStatus 相关字段
+	staticConnectionState          uint32
+	staticFieldState               uint32
+	staticAliveState               uint32
+	staticRobotId                  uint32
+	staticRobotType                uint32
+	staticPerformanceSystemShooter uint32
+	staticPerformanceSystemChassis uint32
+	staticLevel                    uint32
+	staticMaxHealth                uint32
+	staticMaxHeat                  uint32
+	staticHeatCooldownRate         float32
+	staticMaxPower                 uint32
+	staticMaxBufferEnergy          uint32
+	staticMaxChassisEnergy         uint32
+
+	// RobotDynamicStatus 相关字段
+	dynamicCurrentHealth            uint32
+	dynamicCurrentHeat              float32
+	dynamicLastProjectileFireRate   float32
+	dynamicCurrentChassisEnergy     uint32
+	dynamicCurrentBufferEnergy      uint32
+	dynamicCurrentExperience        uint32
+	dynamicExperienceForUpgrade     uint32
+	dynamicTotalProjectilesFired    uint32
+	dynamicRemainingAmmo            uint32
+	dynamicIsOutOfCombat            bool
+	dynamicOutOfCombatCountdown     uint32
+	dynamicCanRemoteHeal            bool
+	dynamicCanRemoteAmmo            bool
+	outOfCombatCountdownTicker      *time.Ticker
+	outOfCombatCountdownStopChan    chan bool
+
+	// RobotPosition 相关字段
+	positionX   float32
+	positionY   float32
+	positionZ   float32
+	positionYaw float32
+
+	// PenaltyInfo 相关字段
+	penaltyType      uint32
+	penaltyEffectSec uint32
+	totalPenaltyNum  uint32
+
+	// RobotPathPlanInfo 相关字段
+	pathIntention uint32
+	pathStartPosX uint32
+	pathStartPosY uint32
+	pathOffsetX   []int32
+	pathOffsetY   []int32
+	pathSenderId  uint32
+
+	// RaderInfoToClient 相关字段
+	raderTargetRobotId uint32
+	raderTargetPosX    float32
+	raderTargetPosY    float32
+	raderTorwardAngle  float32
+	raderIsHighLight   uint32
+
+	// DeployModeStatusSync 相关字段
+	deployModeStatus         uint32
+	deployModeCooldownActive bool
+	deployModeCooldownTimer  *time.Timer
+
+	// Dart 系统相关字段
+	dartState                 uint32      // 0=IDLE, 1=OPENING, 2=OPEN_READY, 3=COOLDOWN, 4=SWITCHING
+	dartTargetId              uint32      // 1-5
+	dartNextTargetId          uint32      // 切换中的下一个目标ID
+	dartStateStartTime        time.Time   // 当前状态开始时间
+	dartTotalTimer            *time.Timer // 15秒总计时器（开启→发射）
+	dartCooldownTimer         *time.Timer // 15秒冷却计时器
+	dartSwitchCooldownActive  bool        // 切换冷却是否激活
+	dartSwitchCooldownTimer   *time.Timer // 1秒切换冷却计时器
+
+	// Assembly 系统相关字段
+	assemblyState                uint32      // 0=IDLE, 1-6=assembly states
+	assemblyDifficulty           uint32      // Current assembly difficulty (1-4)
+	assemblyMaxDifficulty        uint32      // Maximum allowed difficulty (console adjustable, default 1)
+	assemblyStepStartTime        time.Time   // When current state/step started
+	assemblyStepTimer            *time.Timer // Timer for state transitions
+	assemblyLevel4Cooldown       bool        // Whether level 4 is in cooldown
+	assemblyLevel4CooldownTimer  *time.Timer // 90s cooldown timer for level 4
+
+	// Air Support 系统相关字段
+	airSupportStatus           uint32    // 0=IDLE, 1=ACTIVE, 2=LOCKED_BY_OPPONENT
+	airSupportFreeTime         uint32    // Free time remaining (seconds)
+	airSupportCostCoins        uint32    // Coins spent on paid support
+	airSupportActivatedAt      time.Time // When current support was activated
+	airSupportLastAccumulation time.Time // Last time we accumulated free time
+	airSupportIsFreeOnly       bool      // true if activated with commandId=1 (free only mode)
+
+	// GlobalSpecialMechanism 系统相关字段 - 堡垒占领计时
+	// 机制ID: 1=红方堡垒占领, 2=蓝方堡垒占领
+	bastionMechanismIds    []uint32          // 机制ID列表
+	bastionMechanismTimes  []int32           // 机制计时列表(秒)
+	bastionTimerActive     [2]bool           // 计时器是否激活 [0]=红方, [1]=蓝方
+	bastionTimerStartTime  [2]time.Time      // 计时器开始时间
+	bastionTimerTicker     [2]*time.Ticker   // 计时器ticker
+	bastionTimerStopChan   [2]chan bool      // 停止信号通道
+
+	// Rune 能量机关系统相关字段
+	// rune_status: 1=未激活, 2=正在激活, 3=已激活(增益生效中)
+	runeStatus                uint32           // 能量机关状态
+	runeActivatedArms         uint32           // 已激活灯臂数 (0-5)
+	runeTotalRings            uint32           // 总环数
+	runeAverageRings          uint32           // 平均环数 (总环数/灯臂数)
+	runeAvailableActivations  uint32           // 可激活次数
+	runeIsSmallRune           bool             // 是否为小能量机关 (比赛开始3分钟内为小能量机关)
+	runeActivationStartTime   time.Time        // 激活开始时间
+	runeLastArmActivationTime time.Time        // 上次灯臂激活时间
+	runeActivationTimer       *time.Timer      // 激活定时器
+	runeActivationStopChan    chan bool        // 停止激活通道
+	runeFailProbability       float32          // 击中非随机点亮的装甲模块概率 (默认0.1)
+	runeBuffEndTime           time.Time        // Buff效果结束时间
+	runeBuffDuration          uint32           // Buff持续时间(秒)
+	runeBuffAttackBoost       uint32           // 攻击增益百分比
+	runeBuffDefenseBoost      uint32           // 防御增益百分比
+	runeBuffHeatCooldownBoost uint32           // 热量冷却增益倍数 (0=无, 2=2倍, 3=3倍, 5=5倍)
+	runeBuffActive            bool             // Buff是否激活
+	runeBuffTicker            *time.Ticker     // Buff效果定时器
+	runeBuffStopChan          chan bool        // Buff效果停止通道
+	runeLastActivationGrant   int32            // 上次授予激活次数的比赛秒数 (-1表示未授予)
+}
+
+// NewGameSimulator 创建新的比赛模拟器
+func NewGameSimulator(totalRounds uint32) *GameSimulator {
+	// 初始化机器人血量和子弹数（假设有14个机器人）
+	robotHealth := make([]uint32, 14)
+	robotBullets := make([]int32, 14)
+	for i := 0; i < 14; i++ {
+		robotHealth[i] = 600   // 初始血量
+		robotBullets[i] = 350  // 初始子弹数
+	}
+
+	return &GameSimulator{
+		currentRound:    1,
+		totalRounds:     totalRounds,
+		currentStage:    StageNotStarted,
+		stageStartTime:  time.Now(),
+		rand:            rand.New(rand.NewSource(time.Now().UnixNano())),
+
+		// 初始化 GlobalUnitStatus 字段
+		baseHealth:      5000,
+		baseStatus:      1,
+		baseShield:      1500,
+		outpostHealth:   1500,
+		outpostStatus:   1,
+		robotHealth:     robotHealth,
+		robotBullets:    robotBullets,
+		totalDamageRed:  0,
+		totalDamageBlue: 0,
+
+		// 初始化 GlobalLogisticsStatus 字段
+		remainingEconomy:     500,
+		totalEconomyObtained: 0,
+		techLevel:            1,
+		encryptionLevel:      0,
+
+		// 初始化 RobotModuleStatus 字段 (所有模块默认正常状态 = 1)
+		powerManager:      1,
+		rfid:              1,
+		lightStrip:        1,
+		smallShooter:      1,
+		bigShooter:        1,
+		uwb:               1,
+		armor:             1,
+		videoTransmission: 1,
+		capacitor:         1,
+		mainController:    1,
+
+		// 初始化 RobotRespawnStatus 字段 (默认不处于复活状态)
+		isPendingRespawn:       false,
+		totalRespawnProgress:   100,
+		currentRespawnProgress: 0,
+		canFreeRespawn:         true,
+		goldCostForRespawn:     50,
+		canPayForRespawn:       true,
+
+		// 初始化 RobotInjuryStat 字段 (默认无伤害)
+		injuryTotalDamage:           0,
+		injuryCollisionDamage:       0,
+		injurySmallProjectileDamage: 0,
+		injuryLargeProjectileDamage: 0,
+		injuryDartSplashDamage:      0,
+		injuryModuleOfflineDamage:   0,
+		injuryWifiOfflineDamage:     0,
+		injuryPenaltyDamage:         0,
+		injuryServerKillDamage:      0,
+		injuryKillerId:              0,
+
+		// 初始化 RobotStaticStatus 字段 (默认英雄机器人)
+		staticConnectionState:          1, // 1: 已连接
+		staticFieldState:               1, // 1: 在场内
+		staticAliveState:               1, // 1: 存活
+		staticRobotId:                  1, // 机器人ID (默认红方英雄)
+		staticRobotType:                1, // 1: 英雄
+		staticPerformanceSystemShooter: 1, // 1: 默认射手性能
+		staticPerformanceSystemChassis: 1, // 1: 默认底盘性能
+		staticLevel:                    1, // 等级 1
+		staticMaxHealth:                600, // 最大血量
+		staticMaxHeat:                  240, // 最大热量
+		staticHeatCooldownRate:         40.0, // 热量冷却速率
+		staticMaxPower:                 120, // 最大功率
+		staticMaxBufferEnergy:          60, // 最大缓冲能量
+		staticMaxChassisEnergy:         100, // 最大底盘能量
+
+		// 初始化 RobotDynamicStatus 字段 (默认初始状态)
+		dynamicCurrentHealth:          600,   // 当前血量
+		dynamicCurrentHeat:            0.0,   // 当前热量
+		dynamicLastProjectileFireRate: 0.0,   // 上次弹丸发射速率
+		dynamicCurrentChassisEnergy:   100,   // 当前底盘能量
+		dynamicCurrentBufferEnergy:    60,    // 当前缓冲能量
+		dynamicCurrentExperience:      0,     // 当前经验
+		dynamicExperienceForUpgrade:   50,    // 升级所需经验
+		dynamicTotalProjectilesFired:  0,     // 总发射弹丸数
+		dynamicRemainingAmmo:          350,   // 剩余弹药
+		dynamicIsOutOfCombat:          true,  // 是否脱离战斗
+		dynamicOutOfCombatCountdown:   0,     // 脱离战斗倒计时
+		dynamicCanRemoteHeal:          false, // 是否可以远程补血
+		dynamicCanRemoteAmmo:          false, // 是否可以远程补弹
+
+		// 初始化 RobotPosition 字段 (默认位置在场地中心)
+		positionX:   0.0,  // X坐标
+		positionY:   0.0,  // Y坐标
+		positionZ:   0.0,  // Z坐标
+		positionYaw: 0.0,  // 朝向(偏航角)
+
+		// 初始化 PenaltyInfo 字段 (默认无判罚)
+		penaltyType:      0, // 0: 无判罚
+		penaltyEffectSec: 0, // 判罚生效时长(秒)
+		totalPenaltyNum:  0, // 总判罚次数
+
+		// 初始化 RobotPathPlanInfo 字段 (默认无路径规划)
+		pathIntention: 0,     // 意图类型
+		pathStartPosX: 0,     // 起始位置X坐标
+		pathStartPosY: 0,     // 起始位置Y坐标
+		pathOffsetX:   []int32{}, // X偏移数组
+		pathOffsetY:   []int32{}, // Y偏移数组
+		pathSenderId:  0,     // 发送者ID
+
+		// 初始化 RaderInfoToClient 字段 (默认无雷达信息)
+		raderTargetRobotId: 0,   // 目标机器人ID
+		raderTargetPosX:    0.0, // 目标位置X坐标
+		raderTargetPosY:    0.0, // 目标位置Y坐标
+		raderTorwardAngle:  0.0, // 朝向角度
+		raderIsHighLight:   0,   // 是否高亮
+
+		// 初始化 DeployModeStatusSync 字段 (默认未部署)
+		deployModeStatus:         0,     // 0: 未部署
+		deployModeCooldownActive: false, // 冷却未激活
+		deployModeCooldownTimer:  nil,   // 冷却计时器
+
+		// 初始化 Dart 系统字段 (默认空闲状态)
+		dartState:                0,           // 0: IDLE
+		dartTargetId:             0,           // 未选择目标
+		dartNextTargetId:         0,           // 未选择下一个目标
+		dartStateStartTime:       time.Time{}, // 零时间
+		dartTotalTimer:           nil,         // 无计时器
+		dartCooldownTimer:        nil,         // 无计时器
+		dartSwitchCooldownActive: false,       // 切换冷却未激活
+		dartSwitchCooldownTimer:  nil,         // 无切换冷却计时器
+
+		// 初始化 Assembly 系统字段 (默认空闲状态)
+		assemblyState:               0,     // 0: IDLE
+		assemblyDifficulty:          0,     // 无装配进行中
+		assemblyMaxDifficulty:       1,     // 默认最大难度 = 1
+		assemblyStepStartTime:       time.Time{},
+		assemblyStepTimer:           nil,
+		assemblyLevel4Cooldown:      false,
+		assemblyLevel4CooldownTimer: nil,
+
+		// 初始化 Air Support 系统字段
+		airSupportStatus:           0,     // 0: IDLE
+		airSupportFreeTime:         30,    // 初始30秒免费时间
+		airSupportCostCoins:        0,     // 未消耗金币
+		airSupportActivatedAt:      time.Time{},
+		airSupportLastAccumulation: time.Time{}, // 比赛开始时设置
+		airSupportIsFreeOnly:       false, // 默认非免费模式
+
+		// 初始化 GlobalSpecialMechanism 系统字段 - 堡垒占领计时
+		bastionMechanismIds:   []uint32{},
+		bastionMechanismTimes: []int32{},
+		bastionTimerActive:    [2]bool{false, false},
+		bastionTimerStartTime: [2]time.Time{},
+		bastionTimerTicker:    [2]*time.Ticker{nil, nil},
+		bastionTimerStopChan:  [2]chan bool{nil, nil},
+
+		// 初始化 Rune 能量机关系统字段
+		runeStatus:                1,     // 1: 未激活
+		runeActivatedArms:         0,     // 0个灯臂
+		runeTotalRings:            0,     // 0环
+		runeAverageRings:          0,     // 平均0环
+		runeAvailableActivations:  0,     // 0次可激活次数
+		runeIsSmallRune:           true,  // 默认小能量机关
+		runeActivationStartTime:   time.Time{},
+		runeLastArmActivationTime: time.Time{},
+		runeActivationTimer:       nil,
+		runeActivationStopChan:    nil,
+		runeFailProbability:       0.1,   // 10%失败概率
+		runeBuffEndTime:           time.Time{},
+		runeBuffDuration:          0,
+		runeBuffAttackBoost:       0,
+		runeBuffDefenseBoost:      0,
+		runeBuffHeatCooldownBoost: 0,
+		runeBuffActive:            false,
+		runeBuffTicker:            nil,
+		runeBuffStopChan:          nil,
+		runeLastActivationGrant:   -1,    // 未授予
+	}
+}
+
+// updateStage 更新比赛阶段
+func (gs *GameSimulator) updateStage() {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+
+	elapsed := gs.getStageElapsedTimeUnsafe()
+	duration, exists := stageDurations[gs.currentStage]
+
+	if !exists || (elapsed >= duration && duration > 0) {
+		switch gs.currentStage {
+		case StageNotStarted:
+			// 未开始比赛阶段需要手动切换,不自动进入下一阶段
+			return
+		case StagePreparation:
+			gs.currentStage = StageRefereeCheck
+		case StageRefereeCheck:
+			gs.currentStage = StageCountdown
+		case StageCountdown:
+			gs.currentStage = StageBattle
+			// 初始化空中支援累积计时器
+			gs.airSupportLastAccumulation = time.Now()
+		case StageBattle:
+			gs.currentStage = StageCalculating
+			gs.calculateRoundResultUnsafe()
+		case StageCalculating:
+			if gs.currentRound < gs.totalRounds {
+				gs.currentRound++
+				gs.currentStage = StagePreparation
+			} else {
+				gs.currentStage = StageNotStarted
+			}
+		}
+		gs.stageStartTime = time.Now()
+		gs.totalPausedTime = 0
+		logrus.Infof("阶段切换: Stage %d, Round %d/%d", gs.currentStage, gs.currentRound, gs.totalRounds)
+	}
+}
+
+// calculateRoundResult 计算本局结果（加锁版本）
+func (gs *GameSimulator) calculateRoundResult() {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.calculateRoundResultUnsafe()
+}
+
+// calculateRoundResultUnsafe 计算本局结果（不加锁）
+func (gs *GameSimulator) calculateRoundResultUnsafe() {
+	winner := gs.rand.Intn(3)
+	switch winner {
+	case 0: // 红方获胜
+		gs.redScore++
+		logrus.Infof("第 %d 局结束 - 红方获胜! 当前比分 红:%d 蓝:%d", gs.currentRound, gs.redScore, gs.blueScore)
+	case 1: // 蓝方获胜
+		gs.blueScore++
+		logrus.Infof("第 %d 局结束 - 蓝方获胜! 当前比分 红:%d 蓝:%d", gs.currentRound, gs.redScore, gs.blueScore)
+	case 2: // 平局
+		logrus.Infof("第 %d 局结束 - 平局! 当前比分 红:%d 蓝:%d", gs.currentRound, gs.redScore, gs.blueScore)
+	}
+}
+
+// getStageElapsedTime 获取当前阶段已过时间（加锁版本）
+func (gs *GameSimulator) getStageElapsedTime() int32 {
+	gs.mu.RLock()
+	defer gs.mu.RUnlock()
+	return gs.getStageElapsedTimeUnsafe()
+}
+
+// getStageElapsedTimeUnsafe 获取当前阶段已过时间（不加锁）
+func (gs *GameSimulator) getStageElapsedTimeUnsafe() int32 {
+	if gs.isPaused {
+		return int32(gs.pauseStartTime.Sub(gs.stageStartTime).Seconds()) - gs.totalPausedTime
+	}
+	return int32(time.Since(gs.stageStartTime).Seconds()) - gs.totalPausedTime
+}
+
+// getStageCountdown 获取当前阶段倒计时
+func (gs *GameSimulator) getStageCountdown() int32 {
+	gs.mu.RLock()
+	defer gs.mu.RUnlock()
+	return gs.getStageCountdownUnsafe()
+}
+
+// getStageCountdownUnsafe 获取当前阶段倒计时（不加锁）
+func (gs *GameSimulator) getStageCountdownUnsafe() int32 {
+	duration, exists := stageDurations[gs.currentStage]
+	if !exists {
+		return 0
+	}
+	remaining := duration - gs.getStageElapsedTimeUnsafe()
+	if remaining < 0 {
+		return 0
+	}
+	return remaining
+}
+
+// togglePause 切换暂停状态
+func (gs *GameSimulator) togglePause() {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+
+	if gs.isPaused {
+		pauseDuration := int32(time.Since(gs.pauseStartTime).Seconds())
+		gs.totalPausedTime += pauseDuration
+		gs.isPaused = false
+		logrus.Info("比赛继续")
+	} else {
+		gs.pauseStartTime = time.Now()
+		gs.isPaused = true
+		logrus.Info("比赛暂停")
+	}
+}
+
+// getGameStatus 获取当前游戏状态
+func (gs *GameSimulator) getGameStatus() *rmcp.GameStatus {
+	gs.mu.RLock()
+	defer gs.mu.RUnlock()
+
+	return &rmcp.GameStatus{
+		CurrentRound:      gs.currentRound,
+		TotalRounds:       gs.totalRounds,
+		RedScore:          gs.redScore,
+		BlueScore:         gs.blueScore,
+		CurrentStage:      gs.currentStage,
+		StageCountdownSec: gs.getStageCountdownUnsafe(),
+		StageElapsedSec:   gs.getStageElapsedTimeUnsafe(),
+		IsPaused:          gs.isPaused,
+	}
+}
+
+// getGlobalUnitStatus 获取全局单位状态
+func (gs *GameSimulator) getGlobalUnitStatus() *rmcp.GlobalUnitStatus {
+	gs.mu.RLock()
+	defer gs.mu.RUnlock()
+
+	return &rmcp.GlobalUnitStatus{
+		BaseHealth:      gs.baseHealth,
+		BaseStatus:      gs.baseStatus,
+		BaseShield:      gs.baseShield,
+		OutpostHealth:   gs.outpostHealth,
+		OutpostStatus:   gs.outpostStatus,
+		RobotHealth:     gs.robotHealth,
+		RobotBullets:    gs.robotBullets,
+		TotalDamageRed:  gs.totalDamageRed,
+		TotalDamageBlue: gs.totalDamageBlue,
+	}
+}
+
+// getGlobalLogisticsStatus 获取全局物流状态
+func (gs *GameSimulator) getGlobalLogisticsStatus() *rmcp.GlobalLogisticsStatus {
+	gs.mu.RLock()
+	defer gs.mu.RUnlock()
+
+	return &rmcp.GlobalLogisticsStatus{
+		RemainingEconomy:     gs.remainingEconomy,
+		TotalEconomyObtained: gs.totalEconomyObtained,
+		TechLevel:            gs.techLevel,
+		EncryptionLevel:      gs.encryptionLevel,
+	}
+}
+
+// getRobotModuleStatus 获取机器人模块状态
+func (gs *GameSimulator) getRobotModuleStatus() *rmcp.RobotModuleStatus {
+	gs.mu.RLock()
+	defer gs.mu.RUnlock()
+
+	return &rmcp.RobotModuleStatus{
+		PowerManager:      gs.powerManager,
+		Rfid:              gs.rfid,
+		LightStrip:        gs.lightStrip,
+		SmallShooter:      gs.smallShooter,
+		BigShooter:        gs.bigShooter,
+		Uwb:               gs.uwb,
+		Armor:             gs.armor,
+		VideoTransmission: gs.videoTransmission,
+		Capacitor:         gs.capacitor,
+		MainController:    gs.mainController,
+	}
+}
+
+// getRobotRespawnStatus 获取机器人复活状态
+func (gs *GameSimulator) getRobotRespawnStatus() *rmcp.RobotRespawnStatus {
+	gs.mu.RLock()
+	defer gs.mu.RUnlock()
+
+	return &rmcp.RobotRespawnStatus{
+		IsPendingRespawn:       gs.isPendingRespawn,
+		TotalRespawnProgress:   gs.totalRespawnProgress,
+		CurrentRespawnProgress: gs.currentRespawnProgress,
+		CanFreeRespawn:         gs.canFreeRespawn,
+		GoldCostForRespawn:     gs.goldCostForRespawn,
+		CanPayForRespawn:       gs.canPayForRespawn,
+	}
+}
+
+// getRobotInjuryStat 获取机器人伤害统计
+func (gs *GameSimulator) getRobotInjuryStat() *rmcp.RobotInjuryStat {
+	gs.mu.RLock()
+	defer gs.mu.RUnlock()
+	return &rmcp.RobotInjuryStat{
+		TotalDamage:           gs.injuryTotalDamage,
+		CollisionDamage:       gs.injuryCollisionDamage,
+		SmallProjectileDamage: gs.injurySmallProjectileDamage,
+		LargeProjectileDamage: gs.injuryLargeProjectileDamage,
+		DartSplashDamage:      gs.injuryDartSplashDamage,
+		ModuleOfflineDamage:   gs.injuryModuleOfflineDamage,
+		WifiOfflineDamage:     gs.injuryWifiOfflineDamage,
+		PenaltyDamage:         gs.injuryPenaltyDamage,
+		ServerKillDamage:      gs.injuryServerKillDamage,
+		KillerId:              gs.injuryKillerId,
+	}
+}
+
+// getRobotStaticStatus 获取机器人静态状态
+func (gs *GameSimulator) getRobotStaticStatus() *rmcp.RobotStaticStatus {
+	gs.mu.RLock()
+	defer gs.mu.RUnlock()
+
+	return &rmcp.RobotStaticStatus{
+		ConnectionState:          gs.staticConnectionState,
+		FieldState:               gs.staticFieldState,
+		AliveState:               gs.staticAliveState,
+		RobotId:                  gs.staticRobotId,
+		RobotType:                gs.staticRobotType,
+		PerformanceSystemShooter: gs.staticPerformanceSystemShooter,
+		PerformanceSystemChassis: gs.staticPerformanceSystemChassis,
+		Level:                    gs.staticLevel,
+		MaxHealth:                gs.staticMaxHealth,
+		MaxHeat:                  gs.staticMaxHeat,
+		HeatCooldownRate:         gs.staticHeatCooldownRate,
+		MaxPower:                 gs.staticMaxPower,
+		MaxBufferEnergy:          gs.staticMaxBufferEnergy,
+		MaxChassisEnergy:         gs.staticMaxChassisEnergy,
+	}
+}
+
+// getRobotDynamicStatus 获取机器人动态状态
+func (gs *GameSimulator) getRobotDynamicStatus() *rmcp.RobotDynamicStatus {
+	gs.mu.RLock()
+	defer gs.mu.RUnlock()
+
+	return &rmcp.RobotDynamicStatus{
+		CurrentHealth:            gs.dynamicCurrentHealth,
+		CurrentHeat:              gs.dynamicCurrentHeat,
+		LastProjectileFireRate:   gs.dynamicLastProjectileFireRate,
+		CurrentChassisEnergy:     gs.dynamicCurrentChassisEnergy,
+		CurrentBufferEnergy:      gs.dynamicCurrentBufferEnergy,
+		CurrentExperience:        gs.dynamicCurrentExperience,
+		ExperienceForUpgrade:     gs.dynamicExperienceForUpgrade,
+		TotalProjectilesFired:    gs.dynamicTotalProjectilesFired,
+		RemainingAmmo:            gs.dynamicRemainingAmmo,
+		IsOutOfCombat:            gs.dynamicIsOutOfCombat,
+		OutOfCombatCountdown:     gs.dynamicOutOfCombatCountdown,
+		CanRemoteHeal:            gs.dynamicCanRemoteHeal,
+		CanRemoteAmmo:            gs.dynamicCanRemoteAmmo,
+	}
+}
+
+
+// getRobotPosition 获取机器人位置
+func (gs *GameSimulator) getRobotPosition() *rmcp.RobotPosition {
+	gs.mu.RLock()
+	defer gs.mu.RUnlock()
+
+	return &rmcp.RobotPosition{
+		X:   gs.positionX,
+		Y:   gs.positionY,
+		Z:   gs.positionZ,
+		Yaw: gs.positionYaw,
+	}
+}
+
+// getPenaltyInfo 获取判罚信息
+func (gs *GameSimulator) getPenaltyInfo() *rmcp.PenaltyInfo {
+	gs.mu.RLock()
+	defer gs.mu.RUnlock()
+
+	return &rmcp.PenaltyInfo{
+		PenaltyType:      gs.penaltyType,
+		PenaltyEffectSec: gs.penaltyEffectSec,
+		TotalPenaltyNum:  gs.totalPenaltyNum,
+	}
+}
+
+// getRobotPathPlanInfo 获取机器人路径规划信息
+func (gs *GameSimulator) getRobotPathPlanInfo() *rmcp.RobotPathPlanInfo {
+	gs.mu.RLock()
+	defer gs.mu.RUnlock()
+
+	return &rmcp.RobotPathPlanInfo{
+		Intention:  gs.pathIntention,
+		StartPosX:  gs.pathStartPosX,
+		StartPosY:  gs.pathStartPosY,
+		OffsetX:    gs.pathOffsetX,
+		OffsetY:    gs.pathOffsetY,
+		SenderId:   gs.pathSenderId,
+	}
+}
+
+// getRaderInfoToClient 获取雷达信息
+func (gs *GameSimulator) getRaderInfoToClient() *rmcp.RaderInfoToClient {
+	gs.mu.RLock()
+	defer gs.mu.RUnlock()
+
+	return &rmcp.RaderInfoToClient{
+		TargetRobotId: gs.raderTargetRobotId,
+		TargetPosX:    gs.raderTargetPosX,
+		TargetPosY:    gs.raderTargetPosY,
+		TorwardAngle:  gs.raderTorwardAngle,
+		IsHighLight:   gs.raderIsHighLight,
+	}
+}
+
+// setRobotPosition 设置机器人位置
+func (gs *GameSimulator) setRobotPosition(x, y, z, yaw float32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.positionX = x
+	gs.positionY = y
+	gs.positionZ = z
+	gs.positionYaw = yaw
+	logrus.Infof("机器人位置已设置为: X=%.2f, Y=%.2f, Z=%.2f, Yaw=%.2f", x, y, z, yaw)
+}
+
+// setRedScore 设置红方得分
+func (gs *GameSimulator) setRedScore(score uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.redScore = score
+	logrus.Infof("红方得分已设置为: %d", score)
+}
+
+// setBlueScore 设置蓝方得分
+func (gs *GameSimulator) setBlueScore(score uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.blueScore = score
+	logrus.Infof("蓝方得分已设置为: %d", score)
+}
+
+// setCurrentRound 设置当前局号
+func (gs *GameSimulator) setCurrentRound(round uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	if round < 1 || round > gs.totalRounds {
+		logrus.Warnf("无效的局号: %d (有效范围: 1-%d)", round, gs.totalRounds)
+		return
+	}
+	gs.currentRound = round
+	logrus.Infof("当前局号已设置为: %d", round)
+}
+
+// setTotalRounds 设置总局数
+func (gs *GameSimulator) setTotalRounds(rounds uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	if rounds < 1 {
+		logrus.Warn("总局数必须大于0")
+		return
+	}
+	gs.totalRounds = rounds
+	logrus.Infof("总局数已设置为: %d", rounds)
+}
+
+// setStage 设置比赛阶段
+func (gs *GameSimulator) setStage(stage uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	if stage > StageCalculating {
+		logrus.Warnf("无效的阶段: %d (有效范围: 0-5)", stage)
+		return
+	}
+	gs.currentStage = stage
+	gs.stageStartTime = time.Now()
+	gs.totalPausedTime = 0
+	logrus.Infof("当前阶段已设置为: %d", stage)
+}
+
+// resetMatch 重置比赛
+func (gs *GameSimulator) resetMatch() {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.currentRound = 1
+	gs.redScore = 0
+	gs.blueScore = 0
+	gs.currentStage = StageNotStarted
+	gs.stageStartTime = time.Now()
+	gs.isPaused = false
+	gs.totalPausedTime = 0
+
+	// 重置单位状态
+	gs.baseHealth = 5000
+	gs.baseStatus = 1
+	gs.baseShield = 1500
+	gs.outpostHealth = 1500
+	gs.outpostStatus = 1
+	for i := 0; i < len(gs.robotHealth); i++ {
+		gs.robotHealth[i] = 600
+		gs.robotBullets[i] = 350
+	}
+	gs.totalDamageRed = 0
+	gs.totalDamageBlue = 0
+
+	// 重置物流状态
+	gs.remainingEconomy = 500
+	gs.totalEconomyObtained = 0
+	gs.techLevel = 1
+	gs.encryptionLevel = 0
+
+	// 重置 RobotStaticStatus 字段
+	gs.staticConnectionState = 1
+	gs.staticFieldState = 1
+	gs.staticAliveState = 1
+	gs.staticRobotId = 1
+	gs.staticRobotType = 1
+	gs.staticPerformanceSystemShooter = 1
+	gs.staticPerformanceSystemChassis = 1
+	gs.staticLevel = 1
+	gs.staticMaxHealth = 600
+	gs.staticMaxHeat = 240
+	gs.staticHeatCooldownRate = 40.0
+	gs.staticMaxPower = 120
+	gs.staticMaxBufferEnergy = 60
+	gs.staticMaxChassisEnergy = 100
+
+	// 重置 RobotDynamicStatus 字段
+	gs.dynamicCurrentHealth = 600
+	gs.dynamicCurrentHeat = 0.0
+	gs.dynamicLastProjectileFireRate = 0.0
+	gs.dynamicCurrentChassisEnergy = 100
+	gs.dynamicCurrentBufferEnergy = 60
+	gs.dynamicCurrentExperience = 0
+	gs.dynamicExperienceForUpgrade = 50
+	gs.dynamicTotalProjectilesFired = 0
+	gs.dynamicRemainingAmmo = 350
+	gs.dynamicIsOutOfCombat = true
+	gs.dynamicOutOfCombatCountdown = 0
+	gs.dynamicCanRemoteHeal = false
+	gs.dynamicCanRemoteAmmo = false
+
+	// 重置 DeployModeStatusSync 字段
+	if gs.deployModeCooldownTimer != nil {
+		gs.deployModeCooldownTimer.Stop()
+		gs.deployModeCooldownTimer = nil
+	}
+	gs.deployModeStatus = 0
+	gs.deployModeCooldownActive = false
+
+	// 重置 Dart 系统字段
+	if gs.dartTotalTimer != nil {
+		gs.dartTotalTimer.Stop()
+		gs.dartTotalTimer = nil
+	}
+	if gs.dartCooldownTimer != nil {
+		gs.dartCooldownTimer.Stop()
+		gs.dartCooldownTimer = nil
+	}
+	if gs.dartSwitchCooldownTimer != nil {
+		gs.dartSwitchCooldownTimer.Stop()
+		gs.dartSwitchCooldownTimer = nil
+	}
+	gs.dartState = 0
+	gs.dartTargetId = 0
+	gs.dartNextTargetId = 0
+	gs.dartStateStartTime = time.Time{}
+	gs.dartSwitchCooldownActive = false
+
+	// 重置 Assembly 系统字段
+	if gs.assemblyStepTimer != nil {
+		gs.assemblyStepTimer.Stop()
+		gs.assemblyStepTimer = nil
+	}
+	if gs.assemblyLevel4CooldownTimer != nil {
+		gs.assemblyLevel4CooldownTimer.Stop()
+		gs.assemblyLevel4CooldownTimer = nil
+	}
+	gs.assemblyState = 0
+	gs.assemblyDifficulty = 0
+	gs.assemblyMaxDifficulty = 1
+	gs.assemblyLevel4Cooldown = false
+
+	// 重置 Air Support 系统字段
+	gs.airSupportStatus = 0
+	gs.airSupportFreeTime = 30 // 重置为初始30秒
+	gs.airSupportCostCoins = 0
+	gs.airSupportActivatedAt = time.Time{}
+	gs.airSupportLastAccumulation = time.Time{}
+	gs.airSupportIsFreeOnly = false
+
+	// 重置 GlobalSpecialMechanism - 堡垒占领计时
+	for i := 0; i < 2; i++ {
+		if gs.bastionTimerActive[i] {
+			if gs.bastionTimerTicker[i] != nil {
+				gs.bastionTimerTicker[i].Stop()
+				gs.bastionTimerTicker[i] = nil
+			}
+			if gs.bastionTimerStopChan[i] != nil {
+				close(gs.bastionTimerStopChan[i])
+				gs.bastionTimerStopChan[i] = nil
+			}
+			gs.bastionTimerActive[i] = false
+		}
+	}
+	gs.bastionMechanismIds = []uint32{}
+	gs.bastionMechanismTimes = []int32{}
+
+	logrus.Info("比赛已重置")
+}
+
+// setBaseHealth 设置基地血量
+func (gs *GameSimulator) setBaseHealth(health uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.baseHealth = health
+	logrus.Infof("基地血量已设置为: %d", health)
+}
+
+// setBaseStatus 设置基地状态
+func (gs *GameSimulator) setBaseStatus(status uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.baseStatus = status
+	logrus.Infof("基地状态已设置为: %d", status)
+}
+
+// setBaseShield 设置基地护盾
+func (gs *GameSimulator) setBaseShield(shield uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.baseShield = shield
+	logrus.Infof("基地护盾已设置为: %d", shield)
+}
+
+// setOutpostHealth 设置前哨站血量
+func (gs *GameSimulator) setOutpostHealth(health uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.outpostHealth = health
+	logrus.Infof("前哨站血量已设置为: %d", health)
+}
+
+// setOutpostStatus 设置前哨站状态
+func (gs *GameSimulator) setOutpostStatus(status uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.outpostStatus = status
+	logrus.Infof("前哨站状态已设置为: %d", status)
+}
+
+// setRobotHealth 设置机器人血量
+func (gs *GameSimulator) setRobotHealth(robotID int, health uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	if robotID < 0 || robotID >= len(gs.robotHealth) {
+		logrus.Warnf("无效的机器人ID: %d (有效范围: 0-%d)", robotID, len(gs.robotHealth)-1)
+		return
+	}
+	gs.robotHealth[robotID] = health
+	logrus.Infof("机器人 %d 血量已设置为: %d", robotID, health)
+}
+
+// setRobotBullets 设置机器人子弹数
+func (gs *GameSimulator) setRobotBullets(robotID int, bullets int32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	if robotID < 0 || robotID >= len(gs.robotBullets) {
+		logrus.Warnf("无效的机器人ID: %d (有效范围: 0-%d)", robotID, len(gs.robotBullets)-1)
+		return
+	}
+	gs.robotBullets[robotID] = bullets
+	logrus.Infof("机器人 %d 子弹数已设置为: %d", robotID, bullets)
+}
+
+// setTotalDamageRed 设置红方总伤害
+func (gs *GameSimulator) setTotalDamageRed(damage uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.totalDamageRed = damage
+	logrus.Infof("红方总伤害已设置为: %d", damage)
+}
+
+// setTotalDamageBlue 设置蓝方总伤害
+func (gs *GameSimulator) setTotalDamageBlue(damage uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.totalDamageBlue = damage
+	logrus.Infof("蓝方总伤害已设置为: %d", damage)
+}
+
+// setRemainingEconomy 设置剩余经济
+func (gs *GameSimulator) setRemainingEconomy(economy uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.remainingEconomy = economy
+	logrus.Infof("剩余经济已设置为: %d", economy)
+}
+
+// setTotalEconomyObtained 设置总获得经济
+func (gs *GameSimulator) setTotalEconomyObtained(economy uint64) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.totalEconomyObtained = economy
+	logrus.Infof("总获得经济已设置为: %d", economy)
+}
+
+// setTechLevel 设置科技等级
+func (gs *GameSimulator) setTechLevel(level uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.techLevel = level
+	logrus.Infof("科技等级已设置为: %d", level)
+}
+
+// setEncryptionLevel 设置加密等级
+func (gs *GameSimulator) setEncryptionLevel(level uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.encryptionLevel = level
+	logrus.Infof("加密等级已设置为: %d", level)
+}
+
+// setPowerManager 设置电源管理模块状态
+func (gs *GameSimulator) setPowerManager(status uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.powerManager = status
+	logrus.Infof("电源管理模块状态已设置为: %d", status)
+}
+
+// setRfid 设置RFID模块状态
+func (gs *GameSimulator) setRfid(status uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.rfid = status
+	logrus.Infof("RFID模块状态已设置为: %d", status)
+}
+
+// setLightStrip 设置灯条模块状态
+func (gs *GameSimulator) setLightStrip(status uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.lightStrip = status
+	logrus.Infof("灯条模块状态已设置为: %d", status)
+}
+
+// setSmallShooter 设置小弹丸发射器模块状态
+func (gs *GameSimulator) setSmallShooter(status uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.smallShooter = status
+	logrus.Infof("小弹丸发射器模块状态已设置为: %d", status)
+}
+
+// setBigShooter 设置大弹丸发射器模块状态
+func (gs *GameSimulator) setBigShooter(status uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.bigShooter = status
+	logrus.Infof("大弹丸发射器模块状态已设置为: %d", status)
+}
+
+// setUwb 设置UWB模块状态
+func (gs *GameSimulator) setUwb(status uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.uwb = status
+	logrus.Infof("UWB模块状态已设置为: %d", status)
+}
+
+// setArmor 设置装甲模块状态
+func (gs *GameSimulator) setArmor(status uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.armor = status
+	logrus.Infof("装甲模块状态已设置为: %d", status)
+}
+
+// setVideoTransmission 设置图传模块状态
+func (gs *GameSimulator) setVideoTransmission(status uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.videoTransmission = status
+	logrus.Infof("图传模块状态已设置为: %d", status)
+}
+
+// setCapacitor 设置电容模块状态
+func (gs *GameSimulator) setCapacitor(status uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.capacitor = status
+	logrus.Infof("电容模块状态已设置为: %d", status)
+}
+
+// setMainController 设置主控模块状态
+func (gs *GameSimulator) setMainController(status uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.mainController = status
+	logrus.Infof("主控模块状态已设置为: %d", status)
+}
+
+// setIsPendingRespawn 设置是否等待复活
+func (gs *GameSimulator) setIsPendingRespawn(pending bool) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.isPendingRespawn = pending
+	logrus.Infof("机器人等待复活状态已设置为: %v", pending)
+}
+
+// setTotalRespawnProgress 设置总复活进度
+func (gs *GameSimulator) setTotalRespawnProgress(progress uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.totalRespawnProgress = progress
+	logrus.Infof("总复活进度已设置为: %d", progress)
+}
+
+// setCurrentRespawnProgress 设置当前复活进度
+func (gs *GameSimulator) setCurrentRespawnProgress(progress uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.currentRespawnProgress = progress
+	logrus.Infof("当前复活进度已设置为: %d", progress)
+}
+
+// setCanFreeRespawn 设置是否可以免费复活
+func (gs *GameSimulator) setCanFreeRespawn(canFree bool) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.canFreeRespawn = canFree
+	logrus.Infof("可以免费复活已设置为: %v", canFree)
+}
+
+// setGoldCostForRespawn 设置复活金币消耗
+func (gs *GameSimulator) setGoldCostForRespawn(cost uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.goldCostForRespawn = cost
+	logrus.Infof("复活金币消耗已设置为: %d", cost)
+}
+
+// setCanPayForRespawn 设置是否可以支付复活
+func (gs *GameSimulator) setCanPayForRespawn(canPay bool) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.canPayForRespawn = canPay
+	logrus.Infof("可以支付复活已设置为: %v", canPay)
+}
+
+// startRespawnSimulation 开始复活倒计时模拟
+func (gs *GameSimulator) startRespawnSimulation(canFree bool, canPay bool) {
+	gs.mu.Lock()
+
+	// 如果已经在复活中，先停止之前的复活
+	if gs.respawnTicker != nil {
+		gs.respawnTicker.Stop()
+		close(gs.respawnStopChan)
+		gs.respawnTicker = nil
+		gs.respawnStopChan = nil
+	}
+
+	// 设置复活状态
+	gs.isPendingRespawn = true
+	gs.totalRespawnProgress = 100
+	gs.currentRespawnProgress = 0
+	gs.canFreeRespawn = canFree
+	gs.canPayForRespawn = canPay
+
+	// 根据是否可免费复活设置金币消耗
+	if canFree {
+		gs.goldCostForRespawn = 0
+	} else if canPay {
+		gs.goldCostForRespawn = 50
+	} else {
+		gs.goldCostForRespawn = 0
+	}
+
+	gs.mu.Unlock()
+
+	logrus.Infof("开始复活倒计时模拟 - 免费复活: %v, 金币复活: %v", canFree, canPay)
+
+	// 创建新的ticker和stop channel
+	gs.mu.Lock()
+	gs.respawnTicker = time.NewTicker(100 * time.Millisecond) // 100ms更新一次
+	gs.respawnStopChan = make(chan bool)
+	ticker := gs.respawnTicker
+	stopChan := gs.respawnStopChan
+	gs.mu.Unlock()
+
+	// 启动复活进度更新goroutine
+	go func() {
+		for {
+			select {
+			case <-ticker.C:
+				gs.mu.Lock()
+				if gs.currentRespawnProgress < gs.totalRespawnProgress {
+					gs.currentRespawnProgress++
+					logrus.Infof("%d", gs.currentRespawnProgress)
+					if gs.currentRespawnProgress >= gs.totalRespawnProgress {
+						logrus.Info("复活完成!")
+						gs.isPendingRespawn = false
+						gs.currentRespawnProgress = gs.totalRespawnProgress
+					}
+				}
+				gs.mu.Unlock()
+			case <-stopChan:
+				return
+			}
+		}
+	}()
+}
+
+// stopRespawnSimulation 停止复活倒计时模拟
+func (gs *GameSimulator) stopRespawnSimulation() {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+
+	if gs.respawnTicker != nil {
+		gs.respawnTicker.Stop()
+		close(gs.respawnStopChan)
+		gs.respawnTicker = nil
+		gs.respawnStopChan = nil
+	}
+
+	gs.isPendingRespawn = false
+	gs.currentRespawnProgress = 0
+
+	logrus.Info("复活倒计时已停止")
+}
+
+// setInjuryTotalDamage 设置总伤害
+func (gs *GameSimulator) setInjuryTotalDamage(damage uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.injuryTotalDamage = damage
+	logrus.Infof("总伤害已设置为: %d", damage)
+}
+
+// setInjuryCollisionDamage 设置碰撞伤害
+func (gs *GameSimulator) setInjuryCollisionDamage(damage uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.injuryCollisionDamage = damage
+	logrus.Infof("碰撞伤害已设置为: %d", damage)
+}
+
+// setInjurySmallProjectileDamage 设置小弹丸伤害
+func (gs *GameSimulator) setInjurySmallProjectileDamage(damage uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.injurySmallProjectileDamage = damage
+	logrus.Infof("小弹丸伤害已设置为: %d", damage)
+}
+
+// setInjuryLargeProjectileDamage 设置大弹丸伤害
+func (gs *GameSimulator) setInjuryLargeProjectileDamage(damage uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.injuryLargeProjectileDamage = damage
+	logrus.Infof("大弹丸伤害已设置为: %d", damage)
+}
+
+// setInjuryDartSplashDamage 设置飞镖溅射伤害
+func (gs *GameSimulator) setInjuryDartSplashDamage(damage uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.injuryDartSplashDamage = damage
+	logrus.Infof("飞镖溅射伤害已设置为: %d", damage)
+}
+
+// setInjuryModuleOfflineDamage 设置模块离线伤害
+func (gs *GameSimulator) setInjuryModuleOfflineDamage(damage uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.injuryModuleOfflineDamage = damage
+	logrus.Infof("模块离线伤害已设置为: %d", damage)
+}
+
+// setInjuryWifiOfflineDamage 设置WiFi离线伤害
+func (gs *GameSimulator) setInjuryWifiOfflineDamage(damage uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.injuryWifiOfflineDamage = damage
+	logrus.Infof("WiFi离线伤害已设置为: %d", damage)
+}
+
+// setInjuryPenaltyDamage 设置判罚伤害
+func (gs *GameSimulator) setInjuryPenaltyDamage(damage uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.injuryPenaltyDamage = damage
+	logrus.Infof("判罚伤害已设置为: %d", damage)
+}
+
+// setInjuryServerKillDamage 设置服务器击杀伤害
+func (gs *GameSimulator) setInjuryServerKillDamage(damage uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.injuryServerKillDamage = damage
+	logrus.Infof("服务器击杀伤害已设置为: %d", damage)
+}
+
+// setInjuryKillerId 设置击杀者ID
+func (gs *GameSimulator) setInjuryKillerId(id uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.injuryKillerId = id
+	logrus.Infof("击杀者ID已设置为: %d", id)
+}
+
+// setStaticConnectionState 设置机器人连接状态
+func (gs *GameSimulator) setStaticConnectionState(state uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.staticConnectionState = state
+	logrus.Infof("机器人连接状态已设置为: %d", state)
+}
+
+// setStaticFieldState 设置机器人场地状态
+func (gs *GameSimulator) setStaticFieldState(state uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.staticFieldState = state
+	logrus.Infof("机器人场地状态已设置为: %d", state)
+}
+
+// setStaticAliveState 设置机器人存活状态
+func (gs *GameSimulator) setStaticAliveState(state uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.staticAliveState = state
+	logrus.Infof("机器人存活状态已设置为: %d", state)
+}
+
+// setStaticRobotId 设置机器人ID
+func (gs *GameSimulator) setStaticRobotId(id uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.staticRobotId = id
+	logrus.Infof("机器人ID已设置为: %d", id)
+}
+
+// setStaticRobotType 设置机器人类型
+func (gs *GameSimulator) setStaticRobotType(robotType uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.staticRobotType = robotType
+	logrus.Infof("机器人类型已设置为: %d", robotType)
+}
+
+// setStaticPerformanceSystemShooter 设置射手性能系统
+func (gs *GameSimulator) setStaticPerformanceSystemShooter(perf uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.staticPerformanceSystemShooter = perf
+	logrus.Infof("射手性能系统已设置为: %d", perf)
+}
+
+// setStaticPerformanceSystemChassis 设置底盘性能系统
+func (gs *GameSimulator) setStaticPerformanceSystemChassis(perf uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.staticPerformanceSystemChassis = perf
+	logrus.Infof("底盘性能系统已设置为: %d", perf)
+}
+
+// setStaticLevel 设置机器人等级
+func (gs *GameSimulator) setStaticLevel(level uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.staticLevel = level
+	logrus.Infof("机器人等级已设置为: %d", level)
+}
+
+// setStaticMaxHealth 设置最大血量
+func (gs *GameSimulator) setStaticMaxHealth(health uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.staticMaxHealth = health
+	logrus.Infof("最大血量已设置为: %d", health)
+}
+
+// setStaticMaxHeat 设置最大热量
+func (gs *GameSimulator) setStaticMaxHeat(heat uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.staticMaxHeat = heat
+	logrus.Infof("最大热量已设置为: %d", heat)
+}
+
+// setStaticHeatCooldownRate 设置热量冷却速率
+func (gs *GameSimulator) setStaticHeatCooldownRate(rate float32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.staticHeatCooldownRate = rate
+	logrus.Infof("热量冷却速率已设置为: %.2f", rate)
+}
+
+// setStaticMaxPower 设置最大功率
+func (gs *GameSimulator) setStaticMaxPower(power uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.staticMaxPower = power
+	logrus.Infof("最大功率已设置为: %d", power)
+}
+
+// setStaticMaxBufferEnergy 设置最大缓冲能量
+func (gs *GameSimulator) setStaticMaxBufferEnergy(energy uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.staticMaxBufferEnergy = energy
+	logrus.Infof("最大缓冲能量已设置为: %d", energy)
+}
+
+// setStaticMaxChassisEnergy 设置最大底盘能量
+func (gs *GameSimulator) setStaticMaxChassisEnergy(energy uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.staticMaxChassisEnergy = energy
+	logrus.Infof("最大底盘能量已设置为: %d", energy)
+}
+
+// setDynamicCurrentHealth 设置当前血量
+func (gs *GameSimulator) setDynamicCurrentHealth(health uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.dynamicCurrentHealth = health
+	logrus.Infof("当前血量已设置为: %d", health)
+}
+
+// setDynamicCurrentHeat 设置当前热量
+func (gs *GameSimulator) setDynamicCurrentHeat(heat float32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.dynamicCurrentHeat = heat
+	logrus.Infof("当前热量已设置为: %.2f", heat)
+}
+
+// setDynamicLastProjectileFireRate 设置上次弹丸发射速率
+func (gs *GameSimulator) setDynamicLastProjectileFireRate(rate float32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.dynamicLastProjectileFireRate = rate
+	logrus.Infof("上次弹丸发射速率已设置为: %.2f", rate)
+}
+
+// setDynamicCurrentChassisEnergy 设置当前底盘能量
+func (gs *GameSimulator) setDynamicCurrentChassisEnergy(energy uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.dynamicCurrentChassisEnergy = energy
+	logrus.Infof("当前底盘能量已设置为: %d", energy)
+}
+
+// setDynamicCurrentBufferEnergy 设置当前缓冲能量
+func (gs *GameSimulator) setDynamicCurrentBufferEnergy(energy uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.dynamicCurrentBufferEnergy = energy
+	logrus.Infof("当前缓冲能量已设置为: %d", energy)
+}
+
+// setDynamicCurrentExperience 设置当前经验
+func (gs *GameSimulator) setDynamicCurrentExperience(exp uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.dynamicCurrentExperience = exp
+	logrus.Infof("当前经验已设置为: %d", exp)
+}
+
+// setDynamicExperienceForUpgrade 设置升级所需经验
+func (gs *GameSimulator) setDynamicExperienceForUpgrade(exp uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.dynamicExperienceForUpgrade = exp
+	logrus.Infof("升级所需经验已设置为: %d", exp)
+}
+
+// setDynamicTotalProjectilesFired 设置总发射弹丸数
+func (gs *GameSimulator) setDynamicTotalProjectilesFired(count uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.dynamicTotalProjectilesFired = count
+	logrus.Infof("总发射弹丸数已设置为: %d", count)
+}
+
+// setDynamicRemainingAmmo 设置剩余弹药
+func (gs *GameSimulator) setDynamicRemainingAmmo(ammo uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.dynamicRemainingAmmo = ammo
+	logrus.Infof("剩余弹药已设置为: %d", ammo)
+}
+
+// setDynamicIsOutOfCombat 设置是否脱离战斗
+func (gs *GameSimulator) setDynamicIsOutOfCombat(isOut bool) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.dynamicIsOutOfCombat = isOut
+	logrus.Infof("是否脱离战斗已设置为: %v", isOut)
+}
+
+// setDynamicOutOfCombatCountdown 设置脱离战斗倒计时
+func (gs *GameSimulator) setDynamicOutOfCombatCountdown(countdown uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.dynamicOutOfCombatCountdown = countdown
+	logrus.Infof("脱离战斗倒计时已设置为: %d", countdown)
+}
+
+// setDynamicCanRemoteHeal 设置是否可以远程补血
+func (gs *GameSimulator) setDynamicCanRemoteHeal(canHeal bool) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.dynamicCanRemoteHeal = canHeal
+	logrus.Infof("是否可以远程补血已设置为: %v", canHeal)
+}
+
+// setDynamicCanRemoteAmmo 设置是否可以远程补弹
+func (gs *GameSimulator) setDynamicCanRemoteAmmo(canAmmo bool) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.dynamicCanRemoteAmmo = canAmmo
+	logrus.Infof("是否可以远程补弹已设置为: %v", canAmmo)
+}
+
+// startOutOfCombatCountdown 开始脱离战斗倒计时
+func (gs *GameSimulator) startOutOfCombatCountdown(seconds uint32) {
+	gs.mu.Lock()
+
+	// 如果已经在倒计时中，先停止之前的倒计时
+	if gs.outOfCombatCountdownTicker != nil {
+		gs.outOfCombatCountdownTicker.Stop()
+		close(gs.outOfCombatCountdownStopChan)
+		gs.outOfCombatCountdownTicker = nil
+		gs.outOfCombatCountdownStopChan = nil
+	}
+
+	// 设置初始倒计时值
+	gs.dynamicOutOfCombatCountdown = seconds
+	gs.dynamicIsOutOfCombat = false // 正在倒计时，尚未脱离战斗
+
+	gs.mu.Unlock()
+
+	logrus.Infof("开始脱离战斗倒计时: %d秒", seconds)
+
+	// 创建新的ticker和stop channel
+	gs.mu.Lock()
+	gs.outOfCombatCountdownTicker = time.NewTicker(1 * time.Second)
+	gs.outOfCombatCountdownStopChan = make(chan bool)
+	ticker := gs.outOfCombatCountdownTicker
+	stopChan := gs.outOfCombatCountdownStopChan
+	gs.mu.Unlock()
+
+	// 启动倒计时goroutine
+	go func() {
+		for {
+			select {
+			case <-ticker.C:
+				gs.mu.Lock()
+				if gs.dynamicOutOfCombatCountdown > 0 {
+					gs.dynamicOutOfCombatCountdown--
+					logrus.Debugf("脱离战斗倒计时: %d秒", gs.dynamicOutOfCombatCountdown)
+					if gs.dynamicOutOfCombatCountdown == 0 {
+						logrus.Info("脱离战斗倒计时完成!")
+						gs.dynamicIsOutOfCombat = true
+						// 停止ticker
+						ticker.Stop()
+						gs.outOfCombatCountdownTicker = nil
+						gs.outOfCombatCountdownStopChan = nil
+						gs.mu.Unlock()
+
+						// 发送 RobotDynamicStatus 状态同步
+						dynamicStatus := gs.getRobotDynamicStatus()
+						out, err := proto.Marshal(dynamicStatus)
+						if err == nil {
+							err = server.Publish("RobotDynamicStatus", out, false, 0)
+							if err != nil {
+								logrus.Errorf("发布脱战状态同步 RobotDynamicStatus 失败: %v", err)
+							} else {
+								logrus.Infof("已发送脱战状态同步 RobotDynamicStatus: IsOutOfCombat=true")
+							}
+						} else {
+							logrus.Errorf("序列化脱战状态同步 RobotDynamicStatus 失败: %v", err)
+						}
+						return
+					}
+				}
+				gs.mu.Unlock()
+			case <-stopChan:
+				return
+			}
+		}
+	}()
+}
+
+// stopOutOfCombatCountdown 停止脱离战斗倒计时
+func (gs *GameSimulator) stopOutOfCombatCountdown() {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+
+	if gs.outOfCombatCountdownTicker != nil {
+		gs.outOfCombatCountdownTicker.Stop()
+		close(gs.outOfCombatCountdownStopChan)
+		gs.outOfCombatCountdownTicker = nil
+		gs.outOfCombatCountdownStopChan = nil
+	}
+
+	gs.dynamicOutOfCombatCountdown = 0
+	gs.dynamicIsOutOfCombat = false
+
+	logrus.Info("脱离战斗倒计时已停止")
+}
+
+// setPenaltyType 设置判罚类型
+func (gs *GameSimulator) setPenaltyType(penaltyType uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.penaltyType = penaltyType
+	logrus.Infof("判罚类型已设置为: %d", penaltyType)
+}
+
+// setPenaltyEffectSec 设置判罚生效时长
+func (gs *GameSimulator) setPenaltyEffectSec(effectSec uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.penaltyEffectSec = effectSec
+	logrus.Infof("判罚生效时长已设置为: %d秒", effectSec)
+}
+
+// setTotalPenaltyNum 设置总判罚次数
+func (gs *GameSimulator) setTotalPenaltyNum(totalNum uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.totalPenaltyNum = totalNum
+	logrus.Infof("总判罚次数已设置为: %d", totalNum)
+}
+
+// simulatePenalty 模拟判罚 (根据判罚类型设置相应的值)
+func (gs *GameSimulator) simulatePenalty(penaltyType uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+
+	gs.penaltyType = penaltyType
+	gs.totalPenaltyNum++
+
+	// 根据判罚类型设置不同的生效时长
+	switch penaltyType {
+	case 1: // 黄牌
+		gs.penaltyEffectSec = 30
+		logrus.Infof("模拟判罚: 黄牌 (30秒), 总判罚次数: %d", gs.totalPenaltyNum)
+	case 2: // 双方黄牌
+		gs.penaltyEffectSec = 30
+		logrus.Infof("模拟判罚: 双方黄牌 (30秒), 总判罚次数: %d", gs.totalPenaltyNum)
+	case 3: // 红牌
+		gs.penaltyEffectSec = 120
+		logrus.Infof("模拟判罚: 红牌 (120秒), 总判罚次数: %d", gs.totalPenaltyNum)
+	case 4: // 超功率
+		gs.penaltyEffectSec = 10
+		logrus.Infof("模拟判罚: 超功率 (10秒), 总判罚次数: %d", gs.totalPenaltyNum)
+	case 5: // 超热量
+		gs.penaltyEffectSec = 10
+		logrus.Infof("模拟判罚: 超热量 (10秒), 总判罚次数: %d", gs.totalPenaltyNum)
+	case 6: // 超射速
+		gs.penaltyEffectSec = 10
+		logrus.Infof("模拟判罚: 超射速 (10秒), 总判罚次数: %d", gs.totalPenaltyNum)
+	default:
+		gs.penaltyEffectSec = 0
+		logrus.Warnf("未知的判罚类型: %d", penaltyType)
+	}
+}
+
+// setPathIntention 设置路径规划意图
+func (gs *GameSimulator) setPathIntention(intention uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.pathIntention = intention
+	logrus.Infof("路径规划意图已设置为: %d", intention)
+}
+
+// setPathStartPos 设置路径起始位置
+func (gs *GameSimulator) setPathStartPos(x, y uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.pathStartPosX = x
+	gs.pathStartPosY = y
+	logrus.Infof("路径起始位置已设置为: X=%d, Y=%d", x, y)
+}
+
+// setPathOffsets 设置路径偏移数组
+func (gs *GameSimulator) setPathOffsets(offsetX, offsetY []int32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.pathOffsetX = offsetX
+	gs.pathOffsetY = offsetY
+	logrus.Infof("路径偏移数组已设置: X偏移数量=%d, Y偏移数量=%d", len(offsetX), len(offsetY))
+}
+
+// setPathSenderId 设置路径发送者ID
+func (gs *GameSimulator) setPathSenderId(senderId uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.pathSenderId = senderId
+	logrus.Infof("路径发送者ID已设置为: %d", senderId)
+}
+
+// setPathPlan 一次性设置完整的路径规划信息
+func (gs *GameSimulator) setPathPlan(intention, startX, startY, senderId uint32, offsetX, offsetY []int32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.pathIntention = intention
+	gs.pathStartPosX = startX
+	gs.pathStartPosY = startY
+	gs.pathOffsetX = offsetX
+	gs.pathOffsetY = offsetY
+	gs.pathSenderId = senderId
+	logrus.Infof("路径规划已设置: 意图=%d, 起始位置=(%d,%d), 发送者=%d, 路径点数=%d",
+		intention, startX, startY, senderId, len(offsetX))
+}
+
+// setRaderTargetRobotId 设置雷达目标机器人ID
+func (gs *GameSimulator) setRaderTargetRobotId(robotId uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.raderTargetRobotId = robotId
+	logrus.Infof("雷达目标机器人ID已设置为: %d", robotId)
+}
+
+// setRaderTargetPos 设置雷达目标位置
+func (gs *GameSimulator) setRaderTargetPos(x, y float32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.raderTargetPosX = x
+	gs.raderTargetPosY = y
+	logrus.Infof("雷达目标位置已设置为: X=%.2f, Y=%.2f", x, y)
+}
+
+// setRaderTorwardAngle 设置雷达朝向角度
+func (gs *GameSimulator) setRaderTorwardAngle(angle float32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.raderTorwardAngle = angle
+	logrus.Infof("雷达朝向角度已设置为: %.2f°", angle)
+}
+
+// setRaderIsHighLight 设置雷达是否高亮
+func (gs *GameSimulator) setRaderIsHighLight(isHighLight uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.raderIsHighLight = isHighLight
+	logrus.Infof("雷达高亮状态已设置为: %d", isHighLight)
+}
+
+// setRaderInfo 一次性设置完整的雷达信息
+func (gs *GameSimulator) setRaderInfo(robotId uint32, posX, posY, angle float32, isHighLight uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.raderTargetRobotId = robotId
+	gs.raderTargetPosX = posX
+	gs.raderTargetPosY = posY
+	gs.raderTorwardAngle = angle
+	gs.raderIsHighLight = isHighLight
+	logrus.Infof("雷达信息已设置: 目标机器人=%d, 位置=(%.2f,%.2f), 角度=%.2f°, 高亮=%d",
+		robotId, posX, posY, angle, isHighLight)
+}
+
+// getDeployModeStatus 获取部署模式状态
+func (gs *GameSimulator) getDeployModeStatus() *rmcp.DeployModeStatusSync {
+	gs.mu.RLock()
+	defer gs.mu.RUnlock()
+
+	return &rmcp.DeployModeStatusSync{
+		Status: gs.deployModeStatus,
+	}
+}
+
+// handleDeployModeCommand 处理部署模式指令
+// mode: 0 = 退出部署模式, 1 = 进入部署模式
+// 返回是否应该立即发送状态同步消息
+func (gs *GameSimulator) handleDeployModeCommand(mode uint32) bool {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+
+	// 检查是否处于冷却状态
+	if gs.deployModeCooldownActive {
+		logrus.Warnf("部署模式指令被忽略: 当前处于冷却状态 (mode=%d)", mode)
+		return false
+	}
+
+	if mode == 0 {
+		// 退出部署模式: 立即更新状态并发送
+		gs.deployModeStatus = 0
+		logrus.Infof("退出部署模式: 立即发送状态同步")
+		return true
+	} else if mode == 1 {
+		// 进入部署模式: 启动2秒冷却，2秒后更新状态并发送
+		gs.deployModeCooldownActive = true
+		logrus.Infof("进入部署模式: 启动2秒冷却")
+
+		// 停止之前的计时器（如果存在）
+		if gs.deployModeCooldownTimer != nil {
+			gs.deployModeCooldownTimer.Stop()
+		}
+
+		// 创建2秒延迟计时器
+		gs.deployModeCooldownTimer = time.AfterFunc(2*time.Second, func() {
+			gs.mu.Lock()
+			gs.deployModeStatus = 1
+			gs.deployModeCooldownActive = false
+			gs.mu.Unlock()
+
+			// 发送 DeployModeStatusSync
+			status := gs.getDeployModeStatus()
+			out, err := proto.Marshal(status)
+			if err != nil {
+				logrus.Errorf("序列化 DeployModeStatusSync 失败: %v", err)
+				return
+			}
+
+			err = server.Publish("DeployModeStatusSync", out, false, 0)
+			if err != nil {
+				logrus.Errorf("发布 DeployModeStatusSync 失败: %v", err)
+				return
+			}
+
+			logrus.Infof("2秒冷却结束: 进入部署模式，已发送状态同步 (status=1)")
+		})
+
+		return false // 不立即发送，等待2秒后自动发送
+	}
+
+	logrus.Warnf("未知的部署模式指令: mode=%d", mode)
+	return false
+}
+
+// getDartStatus 获取飞镖系统状态
+func (gs *GameSimulator) getDartStatus() *rmcp.DartSelectTargetStatusSync {
+	gs.mu.RLock()
+	defer gs.mu.RUnlock()
+
+	// 根据状态确定 open 字段
+	// OPENING (1): 等待7秒，open=false
+	// OPEN_READY (2): 闸门已开启，open=true
+	// SWITCHING (4): 切换中，open=false（闸门未打开）
+	// COOLDOWN (3): 冷却中，open=false
+	open := gs.dartState == 2 // 只有 OPEN_READY 状态才是 open=true
+
+	return &rmcp.DartSelectTargetStatusSync{
+		TargetId: gs.dartTargetId,
+		Open:     open,
+	}
+}
+
+// handleDartCommand 处理飞镖指令
+// targetId: 目标ID (1-5)
+// open: 是否开启闸门 (true=开启并启动发射, false=仅设置目标不启动)
+// 返回是否应该立即发送状态同步消息
+func (gs *GameSimulator) handleDartCommand(targetId uint32, open bool) bool {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+
+	// 验证 target_id 有效性
+	if targetId < 1 || targetId > 5 {
+		logrus.Warnf("飞镖指令被忽略: 无效的 target_id=%d (有效范围: 1-5)", targetId)
+		return false
+	}
+
+	// 检查是否在切换冷却中
+	if gs.dartSwitchCooldownActive {
+		logrus.Warnf("飞镖指令被拒绝: 当前处于切换冷却中,请等待1秒 (target_id=%d)", targetId)
+		return false
+	}
+
+	// 如果不是开启指令，则仅在 IDLE 状态下允许切换目标
+	if !open {
+		if gs.dartState == 0 {
+			// IDLE 状态:允许切换目标，进入切换冷却
+			gs.startDartSwitchCooldown(targetId)
+			return false
+		} else {
+			// 非 IDLE 状态:拒绝切换目标
+			stateNames := map[uint32]string{
+				1: "OPENING",
+				2: "OPEN_READY",
+				3: "COOLDOWN",
+				4: "SWITCHING",
+			}
+			logrus.Warnf("飞镖目标切换被拒绝: 当前处于 %s 状态,不可切换目标 (target_id=%d)", stateNames[gs.dartState], targetId)
+			return false
+		}
+	}
+
+	// 开启指令:只有 IDLE (0) 状态才能接受
+	if gs.dartState != 0 {
+		stateNames := map[uint32]string{
+			1: "OPENING",
+			2: "OPEN_READY",
+			3: "COOLDOWN",
+			4: "SWITCHING",
+		}
+		logrus.Warnf("飞镖开启指令被拒绝: 当前处于 %s 状态,不可启动 (target_id=%d)", stateNames[gs.dartState], targetId)
+		return false
+	}
+
+	// 开始飞镖发射序列
+	gs.startDartSequence(targetId)
+	// 注意: 不立即发送状态同步，7秒后才会发送 open=1
+	return false
+}
+
+// startDartSwitchCooldown 开始飞镖切换冷却
+// 注意: 此方法假设已经持有 mu 锁
+func (gs *GameSimulator) startDartSwitchCooldown(targetId uint32) {
+	// 停止之前的切换冷却计时器（如果存在）
+	if gs.dartSwitchCooldownTimer != nil {
+		gs.dartSwitchCooldownTimer.Stop()
+		gs.dartSwitchCooldownTimer = nil
+	}
+
+	// 保存当前目标ID（切换期间保持不变）
+	currentTargetId := gs.dartTargetId
+
+	// 设置切换状态
+	gs.dartState = 4 // SWITCHING
+	gs.dartNextTargetId = targetId // 保存正在切换的目标ID
+	// gs.dartTargetId 保持当前值不变，不设置为0
+	gs.dartSwitchCooldownActive = true
+	gs.dartStateStartTime = time.Now()
+
+	logrus.Infof("飞镖开始切换目标: 从 target_id=%d 切换到 target_id=%d, 切换冷却1秒", currentTargetId, targetId)
+
+	// 创建1秒切换冷却计时器
+	gs.dartSwitchCooldownTimer = time.AfterFunc(1*time.Second, func() {
+		gs.mu.Lock()
+		defer gs.mu.Unlock()
+
+		// 切换完成，返回 IDLE 状态并恢复目标ID
+		gs.dartState = 0 // IDLE
+		gs.dartTargetId = gs.dartNextTargetId // 恢复真实的目标ID
+		nextTargetId := gs.dartNextTargetId
+		gs.dartNextTargetId = 0
+		gs.dartSwitchCooldownActive = false
+		gs.dartStateStartTime = time.Time{}
+
+		logrus.Infof("飞镖切换完成: target_id=%d", nextTargetId)
+
+		// 发送 DartSelectTargetStatusSync
+		status := &rmcp.DartSelectTargetStatusSync{
+			TargetId: nextTargetId,
+			Open:     false,
+		}
+		out, err := proto.Marshal(status)
+		if err == nil {
+			err = server.Publish("DartSelectTargetStatusSync", out, false, 0)
+			if err != nil {
+				logrus.Errorf("发布 DartSelectTargetStatusSync 失败: %v", err)
+			} else {
+				logrus.Infof("已发送 DartSelectTargetStatusSync: target_id=%d, open=false", nextTargetId)
+			}
+		}
+	})
+}
+
+// startDartSequence 开始飞镖发射序列
+// 注意: 此方法假设已经持有 mu 锁
+func (gs *GameSimulator) startDartSequence(targetId uint32) {
+	// 停止之前的计时器（如果存在）
+	if gs.dartTotalTimer != nil {
+		gs.dartTotalTimer.Stop()
+		gs.dartTotalTimer = nil
+	}
+	if gs.dartCooldownTimer != nil {
+		gs.dartCooldownTimer.Stop()
+		gs.dartCooldownTimer = nil
+	}
+
+	// 设置初始状态
+	gs.dartState = 1 // OPENING
+	gs.dartTargetId = targetId
+	gs.dartStateStartTime = time.Now()
+
+	logrus.Infof("飞镖系统启动: target_id=%d, 等待7秒后开始开启闸门", targetId)
+
+	// 7秒后发送闸门开启状态同步 (open=1)
+	time.AfterFunc(7*time.Second, func() {
+		gs.mu.Lock()
+		defer gs.mu.Unlock()
+
+		if gs.dartState == 1 { // 仍在 OPENING 状态
+			logrus.Infof("飞镖闸门完全开启: target_id=%d (T+7s)", gs.dartTargetId)
+			gs.dartState = 2 // OPEN_READY
+
+			// 发送 DartSelectTargetStatusSync (open=true)
+			status := &rmcp.DartSelectTargetStatusSync{
+				TargetId: gs.dartTargetId,
+				Open:     true,
+			}
+			out, err := proto.Marshal(status)
+			if err == nil {
+				err = server.Publish("DartSelectTargetStatusSync", out, false, 0)
+				if err != nil {
+					logrus.Errorf("发布 DartSelectTargetStatusSync 失败: %v", err)
+				} else {
+					logrus.Infof("已发送 DartSelectTargetStatusSync: target_id=%d, open=true (闸门已开启)", gs.dartTargetId)
+				}
+			}
+		}
+	})
+
+	// 创建15秒总计时器（开启→发射）
+	gs.dartTotalTimer = time.AfterFunc(15*time.Second, func() {
+		gs.mu.Lock()
+		defer gs.mu.Unlock()
+
+		// 15秒后: 飞镖发射，闸门关闭，进入冷却
+		logrus.Infof("飞镖发射! target_id=%d (T+15s)", gs.dartTargetId)
+
+		// 发送飞镖命中事件 (Event ID 14)
+		event := &rmcp.Event{
+			EventId: 14,
+			Param:   fmt.Sprintf("%d", gs.dartTargetId),
+		}
+		out, err := proto.Marshal(event)
+		if err == nil {
+			err = server.Publish("Event", out, false, 0)
+			if err != nil {
+				logrus.Errorf("发布飞镖命中事件失败: %v", err)
+			}
+		}
+
+		// 进入冷却状态
+		gs.dartState = 3 // COOLDOWN
+		gs.dartStateStartTime = time.Now()
+
+		// 发送 DartSelectTargetStatusSync (open=false)
+		status := &rmcp.DartSelectTargetStatusSync{
+			TargetId: gs.dartTargetId,
+			Open:     false,
+		}
+		statusOut, err := proto.Marshal(status)
+		if err == nil {
+			err = server.Publish("DartSelectTargetStatusSync", statusOut, false, 0)
+			if err != nil {
+				logrus.Errorf("发布 DartSelectTargetStatusSync 失败: %v", err)
+			} else {
+				logrus.Infof("已发送 DartSelectTargetStatusSync: target_id=%d, open=false", gs.dartTargetId)
+			}
+		}
+
+		logrus.Infof("飞镖系统进入冷却: target_id=%d, 冷却时长=15秒", gs.dartTargetId)
+
+		// 创建15秒冷却计时器
+		gs.dartCooldownTimer = time.AfterFunc(15*time.Second, func() {
+			gs.mu.Lock()
+			defer gs.mu.Unlock()
+
+			// 冷却结束，返回 IDLE
+			logrus.Infof("飞镖系统冷却结束: 返回 IDLE 状态")
+			gs.dartState = 0 // IDLE
+			gs.dartTargetId = 0
+			gs.dartStateStartTime = time.Time{}
+
+			// 发送 DartSelectTargetStatusSync (target_id=0, open=false)
+			status := &rmcp.DartSelectTargetStatusSync{
+				TargetId: 0,
+				Open:     false,
+			}
+			out, err := proto.Marshal(status)
+			if err == nil {
+				err = server.Publish("DartSelectTargetStatusSync", out, false, 0)
+				if err != nil {
+					logrus.Errorf("发布 DartSelectTargetStatusSync 失败: %v", err)
+				}
+			}
+		})
+	})
+}
+
+// resetDartState 重置飞镖系统状态
+func (gs *GameSimulator) resetDartState() {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+
+	// 停止所有计时器
+	if gs.dartTotalTimer != nil {
+		gs.dartTotalTimer.Stop()
+		gs.dartTotalTimer = nil
+	}
+	if gs.dartCooldownTimer != nil {
+		gs.dartCooldownTimer.Stop()
+		gs.dartCooldownTimer = nil
+	}
+	if gs.dartSwitchCooldownTimer != nil {
+		gs.dartSwitchCooldownTimer.Stop()
+		gs.dartSwitchCooldownTimer = nil
+	}
+
+	// 重置状态
+	gs.dartState = 0
+	gs.dartTargetId = 0
+	gs.dartNextTargetId = 0
+	gs.dartStateStartTime = time.Time{}
+	gs.dartSwitchCooldownActive = false
+
+	logrus.Info("飞镖系统已重置")
+}
+
+// getTechCoreMotionStateSync 获取科技核心运动状态同步
+func (gs *GameSimulator) getTechCoreMotionStateSync() *rmcp.TechCoreMotionStateSync {
+	gs.mu.RLock()
+	defer gs.mu.RUnlock()
+
+	return &rmcp.TechCoreMotionStateSync{
+		MaximumDifficultyLevel: gs.assemblyMaxDifficulty,
+		Status:                 gs.assemblyState,
+	}
+}
+
+// handleAssemblyCommand 处理装配指令
+// operation: 1 = 确认装配, 2 = 取消装配
+// difficulty: 装配难度 (1-4)
+// 返回是否应该立即发送状态同步消息
+func (gs *GameSimulator) handleAssemblyCommand(operation, difficulty uint32) bool {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+
+	// 处理取消 (operation=2) - 始终响应
+	if operation == 2 {
+		gs.stopAssemblyProcess()
+		gs.assemblyState = 1
+		logrus.Infof("装配已取消")
+		return true // 立即发送状态同步
+	}
+
+	// 处理确认 (operation=1) 在状态=5时
+	if operation == 1 && gs.assemblyState == 5 {
+		// 停止四级超时计时器（如果存在）
+		if gs.assemblyStepTimer != nil {
+			gs.assemblyStepTimer.Stop()
+			gs.assemblyStepTimer = nil
+		}
+
+		// 记录当前装配难度
+		completedDifficulty := gs.assemblyDifficulty
+		gs.assemblyState = 6
+		logrus.Infof("装配已确认,科技核心返回中")
+
+		// 5秒后返回空闲状态
+		gs.assemblyStepTimer = time.AfterFunc(5*time.Second, func() {
+			gs.mu.Lock()
+			gs.assemblyState = 1
+
+			// 如果完成的是四级装配，将最大难度设置为3
+			if completedDifficulty == 4 {
+				gs.assemblyMaxDifficulty = 3
+				logrus.Infof("四级装配已完成，最大装配难度已设置为3")
+			}
+
+			gs.assemblyDifficulty = 0
+			gs.mu.Unlock()
+
+			// 发布 status=1
+			gs.publishAssemblyStatus()
+			logrus.Infof("装配完成,已返回空闲状态")
+		})
+
+		return true // 立即发送 status=6
+	}
+
+	// 如果difficulty > 0且当前空闲,开始新装配
+	// 注意: 状态0和1都表示空闲状态
+	if difficulty > 0 && (gs.assemblyState == 0 || gs.assemblyState == 1) {
+		// 检查四级冷却
+		if difficulty == 4 && gs.assemblyLevel4Cooldown {
+			logrus.Warnf("四级装配冷却中,指令被拒绝 (difficulty=%d)", difficulty)
+			return false
+		}
+
+		// 检查最大难度
+		if difficulty > gs.assemblyMaxDifficulty {
+			logrus.Warnf("装配难度超过最大值,指令被拒绝 (difficulty=%d, max=%d)",
+				difficulty, gs.assemblyMaxDifficulty)
+			return false
+		}
+
+		gs.startAssemblyProcess(difficulty)
+		return true // 立即发送 status=2
+	}
+
+	return false // 不需要立即发送状态同步
+}
+
+// startAssemblyProcess 开始装配流程
+// 注意: 此方法假设已经持有 mu 锁
+func (gs *GameSimulator) startAssemblyProcess(difficulty uint32) {
+	// 清理现有计时器
+	if gs.assemblyStepTimer != nil {
+		gs.assemblyStepTimer.Stop()
+	}
+
+	gs.assemblyDifficulty = difficulty
+	gs.assemblyState = 2
+	gs.assemblyStepStartTime = time.Now()
+
+	logrus.Infof("开始装配: 难度=%d, 状态=2 (科技核心移动中)", difficulty)
+
+	// 根据难度模拟装配步骤
+	totalSteps := int(difficulty) // 1-4步
+
+	// 进度推进辅助函数
+	var progressStep func(currentStep int)
+	progressStep = func(currentStep int) {
+		gs.mu.Lock()
+		defer gs.mu.Unlock()
+
+		if currentStep == 1 {
+			// 第一次转换: 2 -> 3 (科技核心到位)
+			gs.assemblyState = 3
+			gs.assemblyStepStartTime = time.Now()
+			logrus.Infof("装配状态=3 (科技核心到位,可进行首个装配步骤)")
+
+			// 对于四级难度,启动45秒超时
+			if gs.assemblyDifficulty == 4 {
+				gs.assemblyStepTimer = time.AfterFunc(45*time.Second, func() {
+					gs.mu.Lock()
+					defer gs.mu.Unlock()
+
+					// 超时 - 装配失败
+					logrus.Warnf("四级装配超时失败 (45秒内未完成)")
+					gs.stopAssemblyProcess()
+					gs.assemblyState = 1
+					gs.assemblyLevel4Cooldown = true
+
+					// 启动90秒冷却
+					gs.assemblyLevel4CooldownTimer = time.AfterFunc(90*time.Second, func() {
+						gs.mu.Lock()
+						gs.assemblyLevel4Cooldown = false
+						gs.mu.Unlock()
+						logrus.Infof("四级装配冷却结束")
+					})
+
+					gs.publishAssemblyStatus()
+				})
+			}
+
+			gs.publishAssemblyStatus()
+
+			// 调度下一步
+			if totalSteps > 1 {
+				time.AfterFunc(10*time.Second, func() { progressStep(2) })
+			} else {
+				time.AfterFunc(10*time.Second, func() { progressStep(totalSteps + 1) })
+			}
+		} else if currentStep <= totalSteps {
+			// 中间步骤: 3 -> 4 -> 4 -> ... (每步10秒)
+			gs.assemblyState = 4
+			gs.assemblyStepStartTime = time.Now()
+			logrus.Infof("装配状态=4 (步骤 %d/%d 完成)", currentStep-1, totalSteps)
+			gs.publishAssemblyStatus()
+
+			// 调度下一步或完成
+			if currentStep < totalSteps {
+				time.AfterFunc(10*time.Second, func() { progressStep(currentStep + 1) })
+			} else {
+				time.AfterFunc(10*time.Second, func() { progressStep(totalSteps + 1) })
+			}
+		} else {
+			// 最后一步: -> 5 (所有步骤完成,等待确认)
+			gs.assemblyState = 5
+			gs.assemblyStepStartTime = time.Now()
+			logrus.Infof("装配状态=5 (所有步骤完成,等待确认)")
+			gs.publishAssemblyStatus()
+			// 对于1-3级,无超时;四级已在状态3启动超时
+		}
+	}
+
+	// 10秒后开始第一次转换 (状态2持续时间)
+	gs.assemblyStepTimer = time.AfterFunc(10*time.Second, func() { progressStep(1) })
+}
+
+// stopAssemblyProcess 停止装配流程
+// 注意: 此方法假设已经持有 mu 锁
+func (gs *GameSimulator) stopAssemblyProcess() {
+	if gs.assemblyStepTimer != nil {
+		gs.assemblyStepTimer.Stop()
+		gs.assemblyStepTimer = nil
+	}
+	gs.assemblyDifficulty = 0
+	gs.assemblyStepStartTime = time.Time{}
+}
+
+// publishAssemblyStatus 发布装配状态
+// 注意: 此方法假设已经持有 mu 锁
+func (gs *GameSimulator) publishAssemblyStatus() {
+	// 直接构造状态，不调用 getTechCoreMotionStateSync 避免死锁
+	status := &rmcp.TechCoreMotionStateSync{
+		MaximumDifficultyLevel: gs.assemblyMaxDifficulty,
+		Status:                 gs.assemblyState,
+	}
+	out, err := proto.Marshal(status)
+	if err != nil {
+		logrus.Errorf("序列化 TechCoreMotionStateSync 失败: %v", err)
+		return
+	}
+
+	err = server.Publish("TechCoreMotionStateSync", out, false, 0)
+	if err != nil {
+		logrus.Errorf("发布 TechCoreMotionStateSync 失败: %v", err)
+		return
+	}
+
+	// 详细的调试信息
+	stateNames := map[uint32]string{
+		0: "IDLE(空闲/未装配)",
+		1: "IDLE(等待新装配)",
+		2: "科技核心移动中",
+		3: "科技核心到位,可进行首个装配步骤",
+		4: "上一个装配步骤已完成,可进行下一个步骤",
+		5: "装配步骤已全部完成,等待确认",
+		6: "已确认装配,科技核心返回中",
+	}
+	stateName := stateNames[status.Status]
+	if stateName == "" {
+		stateName = fmt.Sprintf("未知状态(%d)", status.Status)
+	}
+
+	logrus.Infof("[能量单元装配] 发送 TechCoreMotionStateSync: Status=%d (%s), MaxDifficulty=%d, 当前难度=%d",
+		status.Status, stateName, status.MaximumDifficultyLevel, gs.assemblyDifficulty)
+}
+
+// getAirSupportStatusSync 获取空中支援状态同步
+func (gs *GameSimulator) getAirSupportStatusSync() *rmcp.AirSupportStatusSync {
+	gs.mu.RLock()
+	defer gs.mu.RUnlock()
+
+	return &rmcp.AirSupportStatusSync{
+		AirsupportStatus: gs.airSupportStatus,
+		LeftTime:         gs.airSupportFreeTime,
+		CostCoins:        gs.airSupportCostCoins,
+	}
+}
+
+// handleAirSupportCommand 处理空中支援指令
+// commandId: 1 = 免费呼叫, 2 = 付费呼叫(优先使用免费时间), 3 = 中断
+// 返回是否应该立即发送状态同步消息
+func (gs *GameSimulator) handleAirSupportCommand(commandId uint32) bool {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+
+	// Command 3: 中断
+	if commandId == 3 {
+		if gs.airSupportStatus == 1 {
+			// 根据实际使用时间扣除
+			elapsed := time.Since(gs.airSupportActivatedAt).Seconds()
+			success := gs.deductAirSupportTime(uint32(elapsed))
+			if !success {
+				logrus.Warnf("空中支援中断时金币不足, 但仍然强制中断")
+			}
+			gs.airSupportStatus = 0
+			gs.airSupportIsFreeOnly = false // 重置标志位
+			logrus.Infof("空中支援已中断, 消耗时间: %.0f秒", elapsed)
+			return true
+		}
+		return false
+	}
+
+	// Commands 1 & 2: 激活空中支援
+	// 只能在比赛进行阶段激活
+	if gs.currentStage != StageBattle {
+		logrus.Warnf("空中支援激活失败: 当前阶段不允许 (stage=%d)", gs.currentStage)
+		return false
+	}
+
+	// 检查是否被锁定
+	if gs.airSupportStatus == 2 {
+		logrus.Warnf("空中支援激活失败: 被对方锁定")
+		return false
+	}
+
+	// 检查是否已经激活
+	if gs.airSupportStatus == 1 {
+		logrus.Warnf("空中支援激活失败: 已在进行中")
+		return false
+	}
+
+	// Command 1: 仅免费
+	if commandId == 1 {
+		if gs.airSupportFreeTime > 0 {
+			gs.airSupportStatus = 1
+			gs.airSupportActivatedAt = time.Now()
+			gs.airSupportIsFreeOnly = true // 标记为仅免费模式
+			logrus.Infof("空中支援已激活 (免费模式), 剩余时间: %d秒", gs.airSupportFreeTime)
+			return true
+		} else {
+			logrus.Warnf("空中支援激活失败: 免费时间已用尽")
+			return false
+		}
+	}
+
+	// Command 2: 付费 (优先使用免费时间)
+	if commandId == 2 {
+		// 检查是否有免费时间或金币
+		if gs.airSupportFreeTime == 0 && gs.remainingEconomy == 0 {
+			logrus.Warnf("空中支援激活失败: 免费时间已用尽且金币为0")
+			return false
+		}
+
+		gs.airSupportStatus = 1
+		gs.airSupportActivatedAt = time.Now()
+		gs.airSupportIsFreeOnly = false // 标记为付费模式
+		if gs.airSupportFreeTime > 0 {
+			logrus.Infof("空中支援已激活 (付费模式, 优先使用免费时间), 剩余免费时间: %d秒", gs.airSupportFreeTime)
+		} else {
+			logrus.Infof("空中支援已激活 (付费模式), 每秒消耗1金币, 剩余金币: %d", gs.remainingEconomy)
+		}
+		return true
+	}
+
+	return false
+}
+
+// deductAirSupportTime 扣除空中支援时间
+// 注意: 此方法假设已经持有 mu 锁
+// 返回值: 是否成功扣费 (金币不足时返回 false)
+func (gs *GameSimulator) deductAirSupportTime(seconds uint32) bool {
+	// 优先扣除免费时间
+	if gs.airSupportFreeTime >= seconds {
+		gs.airSupportFreeTime -= seconds
+		logrus.Infof("消耗免费时间: %d秒, 剩余: %d秒", seconds, gs.airSupportFreeTime)
+		return true
+	} else {
+		// 用完剩余免费时间,然后切换到付费
+		remainingSeconds := seconds - gs.airSupportFreeTime
+		if gs.airSupportFreeTime > 0 {
+			logrus.Infof("消耗所有免费时间: %d秒", gs.airSupportFreeTime)
+			gs.airSupportFreeTime = 0
+		}
+
+		// 检查经济是否足够 (1金币/秒)
+		coinsNeeded := remainingSeconds
+		if gs.remainingEconomy < coinsNeeded {
+			logrus.Warnf("金币不足: 需要 %d 金币, 但只剩余 %d 金币", coinsNeeded, gs.remainingEconomy)
+			return false
+		}
+
+		// 扣除金币 (1金币/秒) - 从 remainingEconomy 扣除
+		gs.remainingEconomy -= coinsNeeded
+		gs.airSupportCostCoins += coinsNeeded
+		logrus.Infof("消耗金币: %d, 剩余经济: %d, 总消耗金币: %d", coinsNeeded, gs.remainingEconomy, gs.airSupportCostCoins)
+		return true
+	}
+}
+
+// updateAirSupportTime 更新空中支援时间 (每秒调用一次)
+func (gs *GameSimulator) updateAirSupportTime() {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+
+	// 在比赛进行阶段累积免费时间 (每60秒+20秒)
+	if gs.currentStage == StageBattle {
+		if gs.airSupportLastAccumulation.IsZero() {
+			gs.airSupportLastAccumulation = time.Now()
+		} else {
+			elapsed := time.Since(gs.airSupportLastAccumulation)
+			if elapsed >= 60*time.Second {
+				gs.airSupportFreeTime += 20
+				gs.airSupportLastAccumulation = time.Now()
+				logrus.Infof("空中支援时间累积: +20秒, 总计: %d秒", gs.airSupportFreeTime)
+			}
+		}
+	}
+
+	// 如果激活中,扣除时间
+	if gs.airSupportStatus == 1 {
+		success := gs.deductAirSupportTime(1)
+
+		// 免费模式下,如果免费时间用尽则强制退出
+		if gs.airSupportIsFreeOnly && gs.airSupportFreeTime == 0 {
+			gs.airSupportStatus = 0
+			gs.airSupportIsFreeOnly = false
+			logrus.Infof("空中支援已自动退出: 免费模式下免费时间已用完")
+			return
+		}
+
+		// 付费模式下,如果金币不足则强制退出
+		if !gs.airSupportIsFreeOnly && !success {
+			gs.airSupportStatus = 0
+			gs.airSupportIsFreeOnly = false
+			logrus.Infof("空中支援已自动退出: 金币不足")
+		}
+	}
+}
+
+// getGlobalSpecialMechanism 获取全局特殊机制状态
+func (gs *GameSimulator) getGlobalSpecialMechanism() *rmcp.GlobalSpecialMechanism {
+	gs.mu.RLock()
+	defer gs.mu.RUnlock()
+
+	return &rmcp.GlobalSpecialMechanism{
+		MechanismId:     gs.bastionMechanismIds,
+		MechanismTimeSec: gs.bastionMechanismTimes,
+	}
+}
+
+// startBastionTimer 开始堡垒占领计时
+// side: 0=红方, 1=蓝方
+func (gs *GameSimulator) startBastionTimer(side int) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+
+	if side < 0 || side > 1 {
+		logrus.Warnf("无效的side参数: %d (有效值: 0=红方, 1=蓝方)", side)
+		return
+	}
+
+	// 如果已经在计时,先停止
+	if gs.bastionTimerActive[side] {
+		if gs.bastionTimerTicker[side] != nil {
+			gs.bastionTimerTicker[side].Stop()
+		}
+		if gs.bastionTimerStopChan[side] != nil {
+			close(gs.bastionTimerStopChan[side])
+		}
+	}
+
+	// 初始化或更新机制列表
+	mechanismId := uint32(side + 1) // 1=红方, 2=蓝方
+	found := false
+	for i, id := range gs.bastionMechanismIds {
+		if id == mechanismId {
+			gs.bastionMechanismTimes[i] = 0
+			found = true
+			break
+		}
+	}
+	if !found {
+		gs.bastionMechanismIds = append(gs.bastionMechanismIds, mechanismId)
+		gs.bastionMechanismTimes = append(gs.bastionMechanismTimes, 0)
+	}
+
+	// 启动计时器
+	gs.bastionTimerActive[side] = true
+	gs.bastionTimerStartTime[side] = time.Now()
+	gs.bastionTimerTicker[side] = time.NewTicker(1 * time.Second)
+	gs.bastionTimerStopChan[side] = make(chan bool)
+
+	ticker := gs.bastionTimerTicker[side]
+	stopChan := gs.bastionTimerStopChan[side]
+
+	sideName := "红方"
+	if side == 1 {
+		sideName = "蓝方"
+	}
+	logrus.Infof("%s堡垒占领计时已开始", sideName)
+
+	// 启动goroutine更新计时
+	go func() {
+		for {
+			select {
+			case <-ticker.C:
+				gs.mu.Lock()
+				// 查找对应的机制ID索引
+				for i, id := range gs.bastionMechanismIds {
+					if id == mechanismId {
+						gs.bastionMechanismTimes[i]++
+						// 如果超过20秒,归0
+						if gs.bastionMechanismTimes[i] > 20 {
+							gs.bastionMechanismTimes[i] = 0
+							logrus.Infof("%s堡垒占领计时超过20秒,已归0", sideName)
+						} else {
+							logrus.Debugf("%s堡垒占领计时: %d秒", sideName, gs.bastionMechanismTimes[i])
+						}
+						break
+					}
+				}
+				gs.mu.Unlock()
+			case <-stopChan:
+				return
+			}
+		}
+	}()
+}
+
+// stopBastionTimer 停止堡垒占领计时
+// side: 0=红方, 1=蓝方
+func (gs *GameSimulator) stopBastionTimer(side int) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+
+	if side < 0 || side > 1 {
+		logrus.Warnf("无效的side参数: %d (有效值: 0=红方, 1=蓝方)", side)
+		return
+	}
+
+	if !gs.bastionTimerActive[side] {
+		logrus.Warnf("计时器未激活,无法停止")
+		return
+	}
+
+	if gs.bastionTimerTicker[side] != nil {
+		gs.bastionTimerTicker[side].Stop()
+		gs.bastionTimerTicker[side] = nil
+	}
+
+	if gs.bastionTimerStopChan[side] != nil {
+		close(gs.bastionTimerStopChan[side])
+		gs.bastionTimerStopChan[side] = nil
+	}
+
+	gs.bastionTimerActive[side] = false
+
+	// 移除机制ID
+	mechanismId := uint32(side + 1)
+	newIds := []uint32{}
+	newTimes := []int32{}
+	for i, id := range gs.bastionMechanismIds {
+		if id != mechanismId {
+			newIds = append(newIds, id)
+			newTimes = append(newTimes, gs.bastionMechanismTimes[i])
+		}
+	}
+	gs.bastionMechanismIds = newIds
+	gs.bastionMechanismTimes = newTimes
+
+	sideName := "红方"
+	if side == 1 {
+		sideName = "蓝方"
+	}
+	logrus.Infof("%s堡垒占领计时已停止", sideName)
+}
+
+// ==================== Rune 能量机关系统 ====================
+
+// getRuneStatusSync 获取能量机关状态同步
+func (gs *GameSimulator) getRuneStatusSync() *rmcp.RuneStatusSync {
+	gs.mu.RLock()
+	defer gs.mu.RUnlock()
+
+	return &rmcp.RuneStatusSync{
+		RuneStatus:    gs.runeStatus,
+		ActivatedArms: gs.runeActivatedArms,
+		AverageRings:  gs.runeTotalRings,
+	}
+}
+
+// getBuff 获取当前机器人的Buff信息
+func (gs *GameSimulator) getBuff() *rmcp.Buff {
+	gs.mu.RLock()
+	defer gs.mu.RUnlock()
+
+	if !gs.runeBuffActive {
+		return nil
+	}
+
+	// 计算剩余时间
+	leftTime := uint32(0)
+	if gs.runeBuffEndTime.After(time.Now()) {
+		leftTime = uint32(gs.runeBuffEndTime.Sub(time.Now()).Seconds())
+	}
+
+	// 根据当前激活的Buff类型返回相应的Buff
+	// 这里我们循环发送不同类型的Buff
+	// Buff类型: 1=攻击增益, 2=防御增益, 3=热量冷却增益
+	// 根据当前时间选择发送哪个Buff
+	buffIndex := (time.Now().UnixNano() / int64(time.Second)) % 3
+
+	var buffType uint32
+	var buffLevel int32
+
+	switch buffIndex {
+	case 0:
+		if gs.runeBuffAttackBoost > 0 {
+			buffType = 1 // 攻击增益
+			buffLevel = int32(gs.runeBuffAttackBoost)
+		} else {
+			return nil
+		}
+	case 1:
+		if gs.runeBuffDefenseBoost > 0 {
+			buffType = 2 // 防御增益
+			buffLevel = int32(gs.runeBuffDefenseBoost)
+		} else {
+			return nil
+		}
+	case 2:
+		if gs.runeBuffHeatCooldownBoost > 0 {
+			buffType = 3 // 热量冷却增益
+			buffLevel = int32(gs.runeBuffHeatCooldownBoost)
+		} else {
+			return nil
+		}
+	}
+
+	return &rmcp.Buff{
+		RobotId:      gs.staticRobotId,
+		BuffType:     buffType,
+		BuffLevel:    buffLevel,
+		BuffMaxTime:  gs.runeBuffDuration,
+		BuffLeftTime: leftTime,
+	}
+}
+
+// updateRuneActivations 更新能量机关激活次数（根据比赛时间）
+// 此函数应该每秒调用一次
+func (gs *GameSimulator) updateRuneActivations() {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+
+	// 只有在比赛进行阶段才更新
+	if gs.currentStage != StageBattle {
+		return
+	}
+
+	// 获取比赛已进行的秒数
+	battleElapsed := gs.getStageElapsedTimeUnsafe()
+
+	// 判断是小能量机关还是大能量机关 (3分钟 = 180秒)
+	wasSmallRune := gs.runeIsSmallRune
+	gs.runeIsSmallRune = battleElapsed < 180
+
+	// 如果从小能量机关切换到大能量机关，记录日志
+	if wasSmallRune && !gs.runeIsSmallRune {
+		logrus.Info("能量机关已切换为大能量机关")
+	}
+
+	// 检查是否需要授予激活次数
+	oldActivations := gs.runeAvailableActivations
+
+	if gs.runeIsSmallRune {
+		// 小能量机关: 比赛开始及比赛开始1分30秒时各获得1次
+		// 0秒时授予1次
+		if battleElapsed >= 0 && gs.runeLastActivationGrant < 0 {
+			gs.runeAvailableActivations++
+			gs.runeLastActivationGrant = 0
+			logrus.Infof("小能量机关: 比赛开始授予1次激活机会, 当前可激活次数: %d", gs.runeAvailableActivations)
+		}
+		// 90秒时授予1次
+		if battleElapsed >= 90 && gs.runeLastActivationGrant < 90 {
+			gs.runeAvailableActivations++
+			gs.runeLastActivationGrant = 90
+			logrus.Infof("小能量机关: 1分30秒授予1次激活机会, 当前可激活次数: %d", gs.runeAvailableActivations)
+		}
+	} else {
+		// 大能量机关: 比赛开始3分钟、4分15秒、5分30秒时各获得1次
+		// 180秒 (3分钟) 时授予1次
+		if battleElapsed >= 180 && gs.runeLastActivationGrant < 180 {
+			gs.runeAvailableActivations++
+			gs.runeLastActivationGrant = 180
+			logrus.Infof("大能量机关: 3分钟授予1次激活机会, 当前可激活次数: %d", gs.runeAvailableActivations)
+		}
+		// 255秒 (4分15秒) 时授予1次
+		if battleElapsed >= 255 && gs.runeLastActivationGrant < 255 {
+			gs.runeAvailableActivations++
+			gs.runeLastActivationGrant = 255
+			logrus.Infof("大能量机关: 4分15秒授予1次激活机会, 当前可激活次数: %d", gs.runeAvailableActivations)
+		}
+		// 330秒 (5分30秒) 时授予1次
+		if battleElapsed >= 330 && gs.runeLastActivationGrant < 330 {
+			gs.runeAvailableActivations++
+			gs.runeLastActivationGrant = 330
+			logrus.Infof("大能量机关: 5分30秒授予1次激活机会, 当前可激活次数: %d", gs.runeAvailableActivations)
+		}
+	}
+
+	// 发送Event: 能量机关可激活次数变化 (event_id = 3)
+	if gs.runeAvailableActivations != oldActivations {
+		gs.sendRuneEventUnsafe(3, fmt.Sprintf("%d", gs.runeAvailableActivations))
+
+		// 如果从0变为1，发送Event: 能量单元当前可进入正在激活状态 (event_id = 4)
+		if oldActivations == 0 && gs.runeAvailableActivations > 0 {
+			gs.sendRuneEventUnsafe(4, "")
+		}
+	}
+}
+
+// sendRuneEventUnsafe 发送能量机关相关事件（不加锁版本）
+func (gs *GameSimulator) sendRuneEventUnsafe(eventId int32, param string) {
+	event := &rmcp.Event{
+		EventId: eventId,
+		Param:   param,
+	}
+	out, err := proto.Marshal(event)
+	if err != nil {
+		logrus.Errorf("序列化 Event 失败: %v", err)
+		return
+	}
+	err = server.Publish("Event", out, false, 0)
+	if err != nil {
+		logrus.Errorf("发布 Event 失败: %v", err)
+		return
+	}
+	logrus.Infof("已发送 Event: event_id=%d, param=%s", eventId, param)
+}
+
+// handleRuneActivateCommand 处理能量机关激活指令
+// activate: 1 = 开始激活
+// 返回是否应该立即发送状态同步消息
+func (gs *GameSimulator) handleRuneActivateCommand(activate uint32) bool {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+
+	if activate != 1 {
+		logrus.Warnf("能量机关激活指令被忽略: 无效的activate值=%d", activate)
+		return false
+	}
+
+	// 检查是否可以激活
+	if gs.runeAvailableActivations == 0 {
+		logrus.Warnf("能量机关激活失败: 可激活次数为0")
+		return false
+	}
+
+	// 检查当前状态
+	if gs.runeStatus != 1 {
+		logrus.Warnf("能量机关激活失败: 当前状态不是未激活状态 (status=%d)", gs.runeStatus)
+		return false
+	}
+
+	// 检查是否在比赛进行阶段
+	if gs.currentStage != StageBattle {
+		logrus.Warnf("能量机关激活失败: 当前不在比赛进行阶段")
+		return false
+	}
+
+	// 扣除激活次数
+	gs.runeAvailableActivations--
+	logrus.Infof("能量机关激活次数扣除1次, 剩余: %d", gs.runeAvailableActivations)
+
+	// 发送Event: 能量机关可激活次数变化 (event_id = 3)
+	gs.sendRuneEventUnsafe(3, fmt.Sprintf("%d", gs.runeAvailableActivations))
+
+	// 开始激活过程
+	gs.startRuneActivationUnsafe()
+
+	return true
+}
+
+// startRuneActivationUnsafe 开始能量机关激活过程（不加锁版本）
+func (gs *GameSimulator) startRuneActivationUnsafe() {
+	// 停止之前的激活过程（如果有）
+	gs.stopRuneActivationUnsafe()
+
+	// 设置激活状态
+	gs.runeStatus = 2 // 正在激活
+	gs.runeActivatedArms = 0
+	gs.runeTotalRings = 0
+	gs.runeAverageRings = 0
+	gs.runeActivationStartTime = time.Now()
+	gs.runeLastArmActivationTime = time.Now()
+
+	logrus.Infof("能量机关开始激活过程 (类型: %s)", gs.getRuneTypeNameUnsafe())
+
+	// 创建停止通道
+	gs.runeActivationStopChan = make(chan bool)
+	stopChan := gs.runeActivationStopChan
+
+	// 启动激活goroutine
+	go gs.runRuneActivationProcess(stopChan)
+}
+
+// getRuneTypeNameUnsafe 获取能量机关类型名称（不加锁版本）
+func (gs *GameSimulator) getRuneTypeNameUnsafe() string {
+	if gs.runeIsSmallRune {
+		return "小能量机关"
+	}
+	return "大能量机关"
+}
+
+// runRuneActivationProcess 运行能量机关激活过程
+func (gs *GameSimulator) runRuneActivationProcess(stopChan chan bool) {
 	for {
+		// 随机等待1.0s - 2.7s
+		gs.mu.RLock()
+		waitTime := time.Duration(1000+gs.rand.Intn(1701)) * time.Millisecond
+		gs.mu.RUnlock()
+
+		select {
+		case <-stopChan:
+			return
+		case <-time.After(waitTime):
+			gs.mu.Lock()
+
+			// 检查是否已经停止
+			if gs.runeStatus != 2 {
+				gs.mu.Unlock()
+				return
+			}
+
+			// 检查是否超过2.5秒未激活新灯臂
+			timeSinceLastArm := time.Since(gs.runeLastArmActivationTime)
+			if timeSinceLastArm > 2500*time.Millisecond && gs.runeActivatedArms > 0 {
+				logrus.Warnf("能量机关激活失败: 超过2.5秒未激活新灯臂")
+				gs.failRuneActivationUnsafe()
+				gs.mu.Unlock()
+				return
+			}
+
+			// 检查小能量机关是否超过20秒
+			if gs.runeIsSmallRune {
+				totalTime := time.Since(gs.runeActivationStartTime)
+				if totalTime > 20*time.Second {
+					logrus.Warnf("小能量机关激活失败: 超过20秒未完成激活")
+					gs.failRuneActivationUnsafe()
+					gs.mu.Unlock()
+					return
+				}
+			}
+
+			// 检查是否击中非随机点亮的装甲模块
+			if gs.rand.Float32() < gs.runeFailProbability {
+				logrus.Warnf("能量机关激活失败: 击中非随机点亮的装甲模块")
+				gs.failRuneActivationUnsafe()
+				gs.mu.Unlock()
+				return
+			}
+
+			// 激活一个灯臂
+			gs.runeActivatedArms++
+			gs.runeLastArmActivationTime = time.Now()
+
+			// 增加环数 (随机1-10)
+			rings := uint32(gs.rand.Intn(10) + 1)
+			gs.runeTotalRings += rings
+
+			// 计算平均环数
+			gs.runeAverageRings = gs.runeTotalRings / gs.runeActivatedArms
+
+			logrus.Infof("能量机关灯臂激活: 第%d个灯臂, 本次环数=%d, 总环数=%d, 平均环数=%d",
+				gs.runeActivatedArms, rings, gs.runeTotalRings, gs.runeAverageRings)
+
+			// 发送 RuneStatusSync
+			gs.publishRuneStatusSyncUnsafe()
+
+			// 发送 Event: 能量机关激活臂数/平均环数 (event_id = 5)
+			gs.sendRuneEventUnsafe(5, fmt.Sprintf("%d+%d", gs.runeActivatedArms, gs.runeAverageRings))
+
+			// 检查是否激活完成 (5个灯臂)
+			if gs.runeActivatedArms >= 5 {
+				logrus.Infof("能量机关激活成功! 灯臂数=%d, 平均环数=%d", gs.runeActivatedArms, gs.runeAverageRings)
+				gs.successRuneActivationUnsafe()
+				gs.mu.Unlock()
+				return
+			}
+
+			gs.mu.Unlock()
+		}
+	}
+}
+
+// failRuneActivationUnsafe 能量机关激活失败（不加锁版本）
+func (gs *GameSimulator) failRuneActivationUnsafe() {
+	gs.runeStatus = 1 // 回到未激活状态
+	gs.runeActivatedArms = 0
+	gs.runeTotalRings = 0
+	gs.runeAverageRings = 0
+	gs.runeActivationStartTime = time.Time{}
+	gs.runeLastArmActivationTime = time.Time{}
+
+	// 发送 RuneStatusSync
+	gs.publishRuneStatusSyncUnsafe()
+
+	logrus.Info("能量机关已重置为未激活状态")
+}
+
+// successRuneActivationUnsafe 能量机关激活成功（不加锁版本）
+func (gs *GameSimulator) successRuneActivationUnsafe() {
+	// 设置为已激活状态
+	gs.runeStatus = 3
+
+	// 发送 RuneStatusSync (rune_status = 3)
+	gs.publishRuneStatusSyncUnsafe()
+
+	// 计算增益效果
+	gs.calculateRuneBuffUnsafe()
+
+	// 启动Buff效果
+	gs.startRuneBuffUnsafe()
+
+	// 发送 Event: 能量机关被激活 (event_id = 6)
+	// 参数为激活类型: 1=小能量机关, 2=大能量机关
+	activationType := "2"
+	if gs.runeIsSmallRune {
+		activationType = "1"
+	}
+	gs.sendRuneEventUnsafe(6, activationType)
+
+	// 大能量机关还需要分发经验
+	if !gs.runeIsSmallRune {
+		logrus.Info("大能量机关激活: 750经验平均分给存活的英雄、步兵、空中机器人")
+		// 这里简化处理，实际应该分发给所有存活的机器人
+	}
+}
+
+// calculateRuneBuffUnsafe 计算能量机关增益效果（不加锁版本）
+func (gs *GameSimulator) calculateRuneBuffUnsafe() {
+	if gs.runeIsSmallRune {
+		// 小能量机关: 25%防御增益，持续45秒
+		gs.runeBuffDuration = 45
+		gs.runeBuffAttackBoost = 0
+		gs.runeBuffDefenseBoost = 25
+		gs.runeBuffHeatCooldownBoost = 0
+		logrus.Infof("小能量机关增益: 防御+25%%, 持续%d秒", gs.runeBuffDuration)
+	} else {
+		// 大能量机关: 根据平均环数和灯臂数计算
+		avgRings := gs.runeAverageRings
+		arms := gs.runeActivatedArms
+
+		// 根据平均环数确定增益百分比 (表5-17)
+		if avgRings >= 1 && avgRings <= 3 {
+			gs.runeBuffAttackBoost = 150
+			gs.runeBuffDefenseBoost = 25
+			gs.runeBuffHeatCooldownBoost = 0
+		} else if avgRings > 3 && avgRings <= 7 {
+			gs.runeBuffAttackBoost = 150
+			gs.runeBuffDefenseBoost = 25
+			gs.runeBuffHeatCooldownBoost = 2
+		} else if avgRings > 7 && avgRings <= 8 {
+			gs.runeBuffAttackBoost = 200
+			gs.runeBuffDefenseBoost = 25
+			gs.runeBuffHeatCooldownBoost = 2
+		} else if avgRings > 8 && avgRings <= 9 {
+			gs.runeBuffAttackBoost = 200
+			gs.runeBuffDefenseBoost = 25
+			gs.runeBuffHeatCooldownBoost = 3
+		} else if avgRings > 9 && avgRings <= 10 {
+			gs.runeBuffAttackBoost = 300
+			gs.runeBuffDefenseBoost = 50
+			gs.runeBuffHeatCooldownBoost = 5
+		}
+
+		// 根据激活灯臂数确定持续时间 (表5-18)
+		switch arms {
+		case 5:
+			gs.runeBuffDuration = 30
+		case 6:
+			gs.runeBuffDuration = 35
+		case 7:
+			gs.runeBuffDuration = 40
+		case 8:
+			gs.runeBuffDuration = 45
+		case 9:
+			gs.runeBuffDuration = 50
+		case 10:
+			gs.runeBuffDuration = 60
+		default:
+			gs.runeBuffDuration = 30
+		}
+
+		logrus.Infof("大能量机关增益: 攻击+%d%%, 防御+%d%%, 热量冷却%d倍, 持续%d秒",
+			gs.runeBuffAttackBoost, gs.runeBuffDefenseBoost, gs.runeBuffHeatCooldownBoost, gs.runeBuffDuration)
+	}
+}
+
+// startRuneBuffUnsafe 启动能量机关Buff效果（不加锁版本）
+func (gs *GameSimulator) startRuneBuffUnsafe() {
+	// 停止之前的Buff（如果有）
+	gs.stopRuneBuffUnsafe()
+
+	gs.runeBuffActive = true
+	gs.runeBuffEndTime = time.Now().Add(time.Duration(gs.runeBuffDuration) * time.Second)
+
+	// 创建停止通道
+	gs.runeBuffStopChan = make(chan bool)
+	stopChan := gs.runeBuffStopChan
+	duration := gs.runeBuffDuration
+
+	logrus.Infof("能量机关Buff效果开始, 持续%d秒", duration)
+
+	// 启动Buff效果计时器
+	go func() {
+		select {
+		case <-stopChan:
+			return
+		case <-time.After(time.Duration(duration) * time.Second):
+			gs.mu.Lock()
+			gs.endRuneBuffUnsafe()
+			gs.mu.Unlock()
+		}
+	}()
+}
+
+// stopRuneBuffUnsafe 停止能量机关Buff效果（不加锁版本）
+func (gs *GameSimulator) stopRuneBuffUnsafe() {
+	if gs.runeBuffStopChan != nil {
+		close(gs.runeBuffStopChan)
+		gs.runeBuffStopChan = nil
+	}
+	if gs.runeBuffTicker != nil {
+		gs.runeBuffTicker.Stop()
+		gs.runeBuffTicker = nil
+	}
+}
+
+// endRuneBuffUnsafe 结束能量机关Buff效果（不加锁版本）
+func (gs *GameSimulator) endRuneBuffUnsafe() {
+	gs.runeBuffActive = false
+	gs.runeBuffAttackBoost = 0
+	gs.runeBuffDefenseBoost = 0
+	gs.runeBuffHeatCooldownBoost = 0
+	gs.runeBuffDuration = 0
+	gs.runeBuffEndTime = time.Time{}
+
+	// 回到未激活状态
+	gs.runeStatus = 1
+	gs.runeActivatedArms = 0
+	gs.runeTotalRings = 0
+	gs.runeAverageRings = 0
+
+	// 发送 RuneStatusSync (rune_status = 1)
+	gs.publishRuneStatusSyncUnsafe()
+
+	logrus.Info("能量机关Buff效果结束, 回到未激活状态")
+}
+
+// stopRuneActivationUnsafe 停止能量机关激活过程（不加锁版本）
+func (gs *GameSimulator) stopRuneActivationUnsafe() {
+	if gs.runeActivationStopChan != nil {
+		close(gs.runeActivationStopChan)
+		gs.runeActivationStopChan = nil
+	}
+	if gs.runeActivationTimer != nil {
+		gs.runeActivationTimer.Stop()
+		gs.runeActivationTimer = nil
+	}
+}
+
+// publishRuneStatusSyncUnsafe 发布能量机关状态同步（不加锁版本）
+func (gs *GameSimulator) publishRuneStatusSyncUnsafe() {
+	status := &rmcp.RuneStatusSync{
+		RuneStatus:    gs.runeStatus,
+		ActivatedArms: gs.runeActivatedArms,
+		AverageRings:  gs.runeTotalRings, // 发送总环数，不是平均环数
+	}
+	out, err := proto.Marshal(status)
+	if err != nil {
+		logrus.Errorf("序列化 RuneStatusSync 失败: %v", err)
+		return
+	}
+	err = server.Publish("RuneStatusSync", out, false, 0)
+	if err != nil {
+		logrus.Errorf("发布 RuneStatusSync 失败: %v", err)
+		return
+	}
+	logrus.Infof("已发送 RuneStatusSync: status=%d, arms=%d, totalRings=%d",
+		gs.runeStatus, gs.runeActivatedArms, gs.runeTotalRings)
+}
+
+// resetRuneState 重置能量机关状态
+func (gs *GameSimulator) resetRuneState() {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+
+	// 停止所有进行中的过程
+	gs.stopRuneActivationUnsafe()
+	gs.stopRuneBuffUnsafe()
+
+	// 重置状态
+	gs.runeStatus = 1
+	gs.runeActivatedArms = 0
+	gs.runeTotalRings = 0
+	gs.runeAverageRings = 0
+	gs.runeAvailableActivations = 0
+	gs.runeIsSmallRune = true
+	gs.runeActivationStartTime = time.Time{}
+	gs.runeLastArmActivationTime = time.Time{}
+	gs.runeBuffEndTime = time.Time{}
+	gs.runeBuffDuration = 0
+	gs.runeBuffAttackBoost = 0
+	gs.runeBuffDefenseBoost = 0
+	gs.runeBuffHeatCooldownBoost = 0
+	gs.runeBuffActive = false
+	gs.runeLastActivationGrant = -1
+
+	logrus.Info("能量机关状态已重置")
+}
+
+// setRuneFailProbability 设置击中非随机点亮装甲模块的概率
+func (gs *GameSimulator) setRuneFailProbability(prob float32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.runeFailProbability = prob
+	logrus.Infof("能量机关失败概率已设置为: %.2f%%", prob*100)
+}
+
+// setRuneAvailableActivations 设置可激活次数
+func (gs *GameSimulator) setRuneAvailableActivations(count uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	oldCount := gs.runeAvailableActivations
+	gs.runeAvailableActivations = count
+
+	// 发送Event
+	if count != oldCount {
+		gs.sendRuneEventUnsafe(3, fmt.Sprintf("%d", count))
+		if oldCount == 0 && count > 0 {
+			gs.sendRuneEventUnsafe(4, "")
+		}
+	}
+
+	logrus.Infof("能量机关可激活次数已设置为: %d", count)
+}
+
+// setRuneStatus 手动设置能量机关状态
+func (gs *GameSimulator) setRuneStatus(status uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.runeStatus = status
+	logrus.Infof("能量机关状态已设置为: %d", status)
+}
+
+// setRuneActivatedArms 手动设置已激活灯臂数
+func (gs *GameSimulator) setRuneActivatedArms(arms uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.runeActivatedArms = arms
+	if arms > 0 {
+		gs.runeAverageRings = gs.runeTotalRings / arms
+	}
+	logrus.Infof("能量机关已激活灯臂数已设置为: %d", arms)
+}
+
+// setRuneAverageRings 手动设置平均环数
+func (gs *GameSimulator) setRuneAverageRings(rings uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.runeAverageRings = rings
+	if gs.runeActivatedArms > 0 {
+		gs.runeTotalRings = rings * gs.runeActivatedArms
+	}
+	logrus.Infof("能量机关平均环数已设置为: %d", rings)
+}
+
+// ==================== Rune 能量机关系统结束 ====================
+
+// ShouldSendVideoStream 检查是否应该发送视频流
+// 对于无人机(ID=6或106): 只有在空中支援激活时才发送视频流
+// 对于其他机器人: 始终发送视频流
+func (gs *GameSimulator) ShouldSendVideoStream() bool {
+	gs.mu.RLock()
+	defer gs.mu.RUnlock()
+
+	// 检查机器人ID是否为6或106 (无人机)
+	isAirSupportRobot := gs.staticRobotId == 6 || gs.staticRobotId == 106
+
+	// 如果是无人机,需要检查空中支援状态
+	if isAirSupportRobot {
+		// 只有在空中支援激活状态下才发送视频流
+		return gs.airSupportStatus == 1
+	}
+
+	// 其他机器人始终发送视频流
+	return true
+}
+
+// stopSimulator 停止模拟器
+func (gs *GameSimulator) stopSimulator() {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.shouldStop = true
+	logrus.Info("模拟器即将停止...")
+}
+
+// shouldStopSimulator 检查是否应该停止
+func (gs *GameSimulator) shouldStopSimulator() bool {
+	gs.mu.RLock()
+	defer gs.mu.RUnlock()
+	return gs.shouldStop
+}
+
+// isPausedSafe 安全地检查是否暂停
+func (gs *GameSimulator) isPausedSafe() bool {
+	gs.mu.RLock()
+	defer gs.mu.RUnlock()
+	return gs.isPaused
+}
+
+// getCurrentStageSafe 安全地获取当前阶段
+func (gs *GameSimulator) getCurrentStageSafe() uint32 {
+	gs.mu.RLock()
+	defer gs.mu.RUnlock()
+	return gs.currentStage
+}
+
+// printStatus 打印当前状态
+func (gs *GameSimulator) printStatus() {
+	gs.mu.RLock()
+	defer gs.mu.RUnlock()
+
+	stageNames := map[uint32]string{
+		StageNotStarted:   "未开始比赛",
+		StagePreparation:  "准备阶段",
+		StageRefereeCheck: "裁判系统自检",
+		StageCountdown:    "五秒倒计时",
+		StageBattle:       "比赛中",
+		StageCalculating:  "比赛结算中",
+	}
+
+	fmt.Println("\n========== 当前比赛状态 ==========")
+	fmt.Printf("局数: %d/%d\n", gs.currentRound, gs.totalRounds)
+	fmt.Printf("比分: 红方 %d : %d 蓝方\n", gs.redScore, gs.blueScore)
+	fmt.Printf("阶段: %s (%d)\n", stageNames[gs.currentStage], gs.currentStage)
+	fmt.Printf("已过时间: %d 秒\n", gs.getStageElapsedTimeUnsafe())
+
+	duration, exists := stageDurations[gs.currentStage]
+	if exists {
+		remaining := duration - gs.getStageElapsedTimeUnsafe()
+		if remaining < 0 {
+			remaining = 0
+		}
+		fmt.Printf("剩余时间: %d 秒\n", remaining)
+	}
+
+	if gs.isPaused {
+		fmt.Println("状态: 已暂停")
+	} else {
+		fmt.Println("状态: 进行中")
+	}
+	fmt.Println("==================================\n")
+}
+
+// handleConsoleCommands 处理控制台命令
+func (gs *GameSimulator) handleConsoleCommands() {
+	scanner := bufio.NewScanner(os.Stdin)
+
+	fmt.Println("\n========== 控制台指令帮助 ==========")
+	fmt.Println("help              - 显示此帮助信息")
+	fmt.Println("status            - 显示当前比赛状态")
+	fmt.Println("pause             - 切换暂停/继续")
+	fmt.Println("reset             - 重置比赛")
+	fmt.Println("red <分数>        - 设置红方得分")
+	fmt.Println("blue <分数>       - 设置蓝方得分")
+	fmt.Println("round <局号>      - 设置当前局号")
+	fmt.Println("total <总局数>    - 设置总局数")
+	fmt.Println("stage <阶段>      - 设置阶段 (0-5)")
+	fmt.Println("  0: 未开始  1: 准备  2: 系统自检  3: 倒计时  4: 比赛中  5: 结算")
+	fmt.Println("\nGlobalUnitStatus 参数:")
+	fmt.Println("base <血量>           - 设置基地血量")
+	fmt.Println("basestatus <状态>     - 设置基地状态")
+	fmt.Println("baseshield <护盾>     - 设置基地护盾")
+	fmt.Println("outpost <血量>        - 设置前哨站血量")
+	fmt.Println("outpoststatus <状态>  - 设置前哨站状态")
+	fmt.Println("  0: 无敌  1: 存活装甲旋转  2: 存活装甲停转  3: 被击毁不可重建  4: 被击毁可重建")
+	fmt.Println("robot <ID> <血量>     - 设置机器人血量 (ID: 0-13)")
+	fmt.Println("bullets <ID> <数量>   - 设置机器人子弹数 (ID: 0-13)")
+	fmt.Println("damagered <伤害>      - 设置红方总伤害")
+	fmt.Println("damageblue <伤害>     - 设置蓝方总伤害")
+	fmt.Println("\nGlobalLogisticsStatus 参数:")
+	fmt.Println("economy <数量>    - 设置剩余经济")
+	fmt.Println("totaleco <数量>   - 设置总获得经济")
+	fmt.Println("tech <等级>       - 设置科技等级")
+	fmt.Println("encrypt <等级>    - 设置加密等级")
+	fmt.Println("\nRobotModuleStatus 参数:")
+	fmt.Println("powermanager <状态>      - 设置电源管理模块状态")
+	fmt.Println("rfid <状态>              - 设置RFID模块状态")
+	fmt.Println("lightstrip <状态>        - 设置灯条模块状态")
+	fmt.Println("smallshooter <状态>      - 设置小弹丸发射器模块状态")
+	fmt.Println("bigshooter <状态>        - 设置大弹丸发射器模块状态")
+	fmt.Println("uwb <状态>               - 设置UWB模块状态")
+	fmt.Println("armor <状态>             - 设置装甲模块状态")
+	fmt.Println("videotrans <状态>        - 设置图传模块状态")
+	fmt.Println("capacitor <状态>         - 设置电容模块状态")
+	fmt.Println("mainctrl <状态>          - 设置主控模块状态")
+	fmt.Println("\nRobotRespawnStatus 参数:")
+	fmt.Println("respawnpending <0/1>     - 设置是否等待复活 (0: 否, 1: 是)")
+	fmt.Println("respawntotal <进度>      - 设置总复活进度")
+	fmt.Println("respawncurrent <进度>    - 设置当前复活进度")
+	fmt.Println("respawnfree <0/1>        - 设置是否可以免费复活 (0: 否, 1: 是)")
+	fmt.Println("respawncost <金币>       - 设置复活金币消耗")
+	fmt.Println("respawnpay <0/1>         - 设置是否可以支付复活 (0: 否, 1: 是)")
+	fmt.Println("startrespawn <免费0/1> <付费0/1> - 开始复活倒计时模拟")
+	fmt.Println("stoprespawn              - 停止复活倒计时模拟")
+	fmt.Println("\nRobotInjuryStat 参数:")
+	fmt.Println("injurytotal <伤害>       - 设置总伤害")
+	fmt.Println("injurycollision <伤害>   - 设置碰撞伤害")
+	fmt.Println("injurysmall <伤害>       - 设置小弹丸伤害")
+	fmt.Println("injurylarge <伤害>       - 设置大弹丸伤害")
+	fmt.Println("injurydart <伤害>        - 设置飞镖溅射伤害")
+	fmt.Println("injurymodule <伤害>      - 设置模块离线伤害")
+	fmt.Println("injurywifi <伤害>        - 设置WiFi离线伤害")
+	fmt.Println("injurypenalty <伤害>     - 设置判罚伤害")
+	fmt.Println("injuryserver <伤害>      - 设置服务器击杀伤害")
+	fmt.Println("injurykiller <ID>        - 设置击杀者ID")
+	fmt.Println("\nRobotStaticStatus 参数:")
+	fmt.Println("staticconn <状态>        - 设置连接状态 (0: 断开, 1: 已连接)")
+	fmt.Println("staticfield <状态>       - 设置场地状态 (0: 场外, 1: 场内)")
+	fmt.Println("staticalive <状态>       - 设置存活状态 (0: 死亡, 1: 存活)")
+	fmt.Println("staticrobotid <ID>       - 设置机器人ID")
+	fmt.Println("statictype <类型>        - 设置机器人类型 (1: 英雄, 2: 工程, 3: 步兵, 4: 无人机, 5: 哨兵)")
+	fmt.Println("staticshooter <性能>     - 设置射手性能系统")
+	fmt.Println("staticchassis <性能>     - 设置底盘性能系统")
+	fmt.Println("staticlevel <等级>       - 设置机器人等级")
+	fmt.Println("staticmaxhp <血量>       - 设置最大血量")
+	fmt.Println("staticmaxheat <热量>     - 设置最大热量")
+	fmt.Println("staticheatrate <速率>    - 设置热量冷却速率")
+	fmt.Println("staticmaxpower <功率>    - 设置最大功率")
+	fmt.Println("staticmaxbuf <能量>      - 设置最大缓冲能量")
+	fmt.Println("staticmaxchassis <能量>  - 设置最大底盘能量")
+	fmt.Println("\nRobotDynamicStatus 参数:")
+	fmt.Println("dynhp <血量>             - 设置当前血量")
+	fmt.Println("dynheat <热量>           - 设置当前热量")
+	fmt.Println("dynfirerate <速率>       - 设置上次弹丸发射速率")
+	fmt.Println("dynchassis <能量>        - 设置当前底盘能量")
+	fmt.Println("dynbuffer <能量>         - 设置当前缓冲能量")
+	fmt.Println("dynexp <经验>            - 设置当前经验")
+	fmt.Println("dynexpup <经验>          - 设置升级所需经验")
+	fmt.Println("dynfired <数量>          - 设置总发射弹丸数")
+	fmt.Println("dynammo <数量>           - 设置剩余弹药")
+	fmt.Println("dynoutcombat <0/1>       - 设置是否脱离战斗 (0: 否, 1: 是)")
+	fmt.Println("dynoutcount <秒>         - 设置脱离战斗倒计时")
+	fmt.Println("startoutcombat <秒>      - 开始脱离战斗倒计时 (自动每秒递减)")
+	fmt.Println("stopoutcombat            - 停止脱离战斗倒计时")
+	fmt.Println("dynheal <0/1>            - 设置是否可以远程补血 (0: 否, 1: 是)")
+	fmt.Println("dynammoremote <0/1>      - 设置是否可以远程补弹 (0: 否, 1: 是)")
+	fmt.Println("\nPenaltyInfo 判罚信息参数:")
+	fmt.Println("penalty <类型>           - 模拟判罚")
+	fmt.Println("  1: 黄牌 (30秒)")
+	fmt.Println("  2: 双方黄牌 (30秒)")
+	fmt.Println("  3: 红牌 (120秒)")
+	fmt.Println("  4: 超功率 (10秒)")
+	fmt.Println("  5: 超热量 (10秒)")
+	fmt.Println("  6: 超射速 (10秒)")
+	fmt.Println("penaltytype <类型>       - 手动设置判罚类型 (0-6)")
+	fmt.Println("penaltyeffect <秒数>     - 手动设置判罚生效时长")
+	fmt.Println("penaltynum <次数>        - 手动设置总判罚次数")
+	fmt.Println("\nRobotPathPlanInfo 路径规划参数:")
+	fmt.Println("pathintent <意图>        - 设置路径规划意图类型")
+	fmt.Println("pathstart <X> <Y>        - 设置路径起始位置")
+	fmt.Println("pathsender <ID>          - 设置路径发送者ID")
+	fmt.Println("pathplan <意图> <起始X> <起始Y> <发送者ID> <偏移X列表> <偏移Y列表>")
+	fmt.Println("  - 一次性设置完整路径规划 (偏移列表用逗号分隔)")
+	fmt.Println("  示例: pathplan 1 100 200 5 10,20,30 15,25,35")
+	fmt.Println("\nRaderInfoToClient 雷达信息参数:")
+	fmt.Println("raderrobot <ID>                 - 设置雷达目标机器人ID")
+	fmt.Println("raderpos <X> <Y>                - 设置雷达目标位置 (浮点数)")
+	fmt.Println("raderangle <角度>               - 设置雷达朝向角度 (浮点数, 单位:度)")
+	fmt.Println("raderhighlight <0/1>            - 设置雷达是否高亮 (0: 否, 1: 是)")
+	fmt.Println("raderinfo <机器人ID> <X> <Y> <角度> <高亮0/1>")
+	fmt.Println("  - 一次性设置完整雷达信息")
+	fmt.Println("  示例: raderinfo 3 4.5 2.3 45.0 1")
+	fmt.Println("\nEvent 事件发送:")
+	fmt.Println("event <ID> [参数]        - 发送事件 (ID: 1-18)")
+	fmt.Println("  1: 击杀事件 (参数: 击杀者ID+被击毁机器人ID)")
+	fmt.Println("  2: 基地/前哨站被摧毁 (参数: 目标ID,如蓝方前哨站111)")
+	fmt.Println("  3: 能量机关可激活次数变化 (参数: 变化后可激活次数)")
+	fmt.Println("  4: 能量单元可进入激活状态 (无参数)")
+	fmt.Println("  5: 能量机关激活臂数/平均环数 (参数: 激活臂数+平均环数)")
+	fmt.Println("  6: 能量机关被激活 (参数: 激活类型)")
+	fmt.Println("  7: 己方英雄进入部署模式 (无参数)")
+	fmt.Println("  8: 己方英雄狙击伤害 (参数: 累计狙击伤害)")
+	fmt.Println("  9: 对方英雄狙击伤害 (参数: 累计狙击伤害)")
+	fmt.Println("  10: 己方呼叫空中支援 (无参数)")
+	fmt.Println("  11: 己方空中支援被打断 (参数: 对方剩余打断次数)")
+	fmt.Println("  12: 对方呼叫空中支援 (无参数)")
+	fmt.Println("  13: 对方空中支援被打断 (参数: 己方剩余打断次数)")
+	fmt.Println("  14: 飞镖命中 (参数: 1前哨站/2基地固定/3基地随机)")
+	fmt.Println("  15: 飞镖闸门开启 (参数: 1己方/2对方)")
+	fmt.Println("  16: 己方基地遭到攻击 (无参数)")
+	fmt.Println("  17: 前哨站停转 (参数: 1己方/2对方)")
+	fmt.Println("  18: 基地护甲展开 (参数: 1己方/2对方)")
+	fmt.Println("\nRobotPosition 参数:")
+	fmt.Println("position <X> <Y> <Z> <Yaw> - 设置机器人位置和朝向")
+	fmt.Println("  X, Y, Z: 三维坐标 (浮点数)")
+	fmt.Println("  Yaw: 偏航角/朝向 (浮点数, 单位:度)")
+	fmt.Println("\nAssembly 装配系统参数:")
+	fmt.Println("assemblystatus              - 显示当前装配状态")
+	fmt.Println("assemblymax <等级>          - 设置最大装配难度等级 (1-4)")
+	fmt.Println("assemblystart <难度>        - 开始装配模拟 (难度: 1-4)")
+	fmt.Println("assemblycancel              - 取消当前装配")
+	fmt.Println("assemblyconfirm             - 在状态5时确认装配完成")
+	fmt.Println("\nAir Support 空中支援参数:")
+	fmt.Println("airsupportstatus            - 显示空中支援状态")
+	fmt.Println("airsupportfree <秒数>       - 设置免费时间")
+	fmt.Println("airsupportlock <0/1>        - 设置锁定状态 (0=解锁, 1=锁定)")
+	fmt.Println("airsupportstart <1/2>       - 启动空中支援 (1=免费, 2=付费)")
+	fmt.Println("  注: 付费模式会从 remainingEconomy 扣除金币 (1金币/秒)")
+	fmt.Println("  注: 金币为0且免费时间耗尽时,付费空中支援会被拒绝/强制结束")
+	fmt.Println("airsupportstop              - 中断空中支援")
+	fmt.Println("\nGlobalSpecialMechanism 堡垒占领计时:")
+	fmt.Println("bastionstart <0/1>          - 开始堡垒占领计时 (0=红方, 1=蓝方)")
+	fmt.Println("  注: 计时最大20秒,超过后自动归0")
+	fmt.Println("bastionstop <0/1>           - 停止堡垒占领计时 (0=红方, 1=蓝方)")
+	fmt.Println("bastionstatus               - 显示堡垒占领计时状态")
+	fmt.Println("\nRune 能量机关参数:")
+	fmt.Println("runestatus                  - 显示能量机关状态")
+	fmt.Println("runeactivate                - 手动触发能量机关激活")
+	fmt.Println("runeactivations <次数>      - 设置可激活次数")
+	fmt.Println("runefailprob <概率>         - 设置失败概率 (0.0-1.0, 默认0.1=10%)")
+	fmt.Println("runesetstatus <状态>        - 设置状态 (1=未激活, 2=正在激活, 3=已激活)")
+	fmt.Println("runesetarms <灯臂数>        - 设置已激活灯臂数 (0-5)")
+	fmt.Println("runesetrings <环数>         - 设置平均环数 (1-10)")
+	fmt.Println("runeset <灯臂数> <环数>     - 同时设置灯臂数和平均环数")
+	fmt.Println("runereset                   - 重置能量机关状态")
+	fmt.Println("runesync                    - 手动发送RuneStatusSync")
+	fmt.Println("\nstop              - 停止模拟器")
+	fmt.Println("=====================================\n")
+
+	for scanner.Scan() {
+		input := strings.TrimSpace(scanner.Text())
+		if input == "" {
+			continue
+		}
+
+		parts := strings.Fields(input)
+		cmd := strings.ToLower(parts[0])
+
+		switch cmd {
+		case "help":
+			fmt.Println("\n========== 控制台指令帮助 ==========")
+			fmt.Println("help              - 显示此帮助信息")
+			fmt.Println("status            - 显示当前比赛状态")
+			fmt.Println("pause             - 切换暂停/继续")
+			fmt.Println("reset             - 重置比赛")
+			fmt.Println("red <分数>        - 设置红方得分")
+			fmt.Println("blue <分数>       - 设置蓝方得分")
+			fmt.Println("round <局号>      - 设置当前局号")
+			fmt.Println("total <总局数>    - 设置总局数")
+			fmt.Println("stage <阶段>      - 设置阶段 (0-5)")
+			fmt.Println("  0: 未开始  1: 准备  2: 系统自检  3: 倒计时  4: 比赛中  5: 结算")
+			fmt.Println("\nGlobalUnitStatus 参数:")
+			fmt.Println("base <血量>           - 设置基地血量")
+			fmt.Println("basestatus <状态>     - 设置基地状态")
+			fmt.Println("baseshield <护盾>     - 设置基地护盾")
+			fmt.Println("outpost <血量>        - 设置前哨站血量")
+			fmt.Println("outpoststatus <状态>  - 设置前哨站状态")
+			fmt.Println("  0: 无敌  1: 存活装甲旋转  2: 存活装甲停转  3: 被击毁不可重建  4: 被击毁可重建")
+			fmt.Println("robot <ID> <血量>     - 设置机器人血量 (ID: 0-13)")
+			fmt.Println("bullets <ID> <数量>   - 设置机器人子弹数 (ID: 0-13)")
+			fmt.Println("damagered <伤害>      - 设置红方总伤害")
+			fmt.Println("damageblue <伤害>     - 设置蓝方总伤害")
+			fmt.Println("\nGlobalLogisticsStatus 参数:")
+			fmt.Println("economy <数量>    - 设置剩余经济")
+			fmt.Println("totaleco <数量>   - 设置总获得经济")
+			fmt.Println("tech <等级>       - 设置科技等级")
+			fmt.Println("encrypt <等级>    - 设置加密等级")
+			fmt.Println("\nRobotModuleStatus 参数:")
+			fmt.Println("powermanager <状态>      - 设置电源管理模块状态")
+			fmt.Println("rfid <状态>              - 设置RFID模块状态")
+			fmt.Println("lightstrip <状态>        - 设置灯条模块状态")
+			fmt.Println("smallshooter <状态>      - 设置小弹丸发射器模块状态")
+			fmt.Println("bigshooter <状态>        - 设置大弹丸发射器模块状态")
+			fmt.Println("uwb <状态>               - 设置UWB模块状态")
+			fmt.Println("armor <状态>             - 设置装甲模块状态")
+			fmt.Println("videotrans <状态>        - 设置图传模块状态")
+			fmt.Println("capacitor <状态>         - 设置电容模块状态")
+			fmt.Println("mainctrl <状态>          - 设置主控模块状态")
+			fmt.Println("\nRobotRespawnStatus 参数:")
+			fmt.Println("respawnpending <0/1>     - 设置是否等待复活 (0: 否, 1: 是)")
+			fmt.Println("respawntotal <进度>      - 设置总复活进度")
+			fmt.Println("respawncurrent <进度>    - 设置当前复活进度")
+			fmt.Println("respawnfree <0/1>        - 设置是否可以免费复活 (0: 否, 1: 是)")
+			fmt.Println("respawncost <金币>       - 设置复活金币消耗")
+			fmt.Println("respawnpay <0/1>         - 设置是否可以支付复活 (0: 否, 1: 是)")
+			fmt.Println("startrespawn <免费0/1> <付费0/1> - 开始复活倒计时模拟")
+			fmt.Println("stoprespawn              - 停止复活倒计时模拟")
+			fmt.Println("\nRobotInjuryStat 参数:")
+			fmt.Println("injurytotal <伤害>       - 设置总伤害")
+			fmt.Println("injurycollision <伤害>   - 设置碰撞伤害")
+			fmt.Println("injurysmall <伤害>       - 设置小弹丸伤害")
+			fmt.Println("injurylarge <伤害>       - 设置大弹丸伤害")
+			fmt.Println("injurydart <伤害>        - 设置飞镖溅射伤害")
+			fmt.Println("injurymodule <伤害>      - 设置模块离线伤害")
+			fmt.Println("injurywifi <伤害>        - 设置WiFi离线伤害")
+			fmt.Println("injurypenalty <伤害>     - 设置判罚伤害")
+			fmt.Println("injuryserver <伤害>      - 设置服务器击杀伤害")
+			fmt.Println("injurykiller <ID>        - 设置击杀者ID")
+			fmt.Println("\nRobotStaticStatus 参数:")
+			fmt.Println("staticconn <状态>        - 设置连接状态 (0: 断开, 1: 已连接)")
+			fmt.Println("staticfield <状态>       - 设置场地状态 (0: 场外, 1: 场内)")
+			fmt.Println("staticalive <状态>       - 设置存活状态 (0: 死亡, 1: 存活)")
+			fmt.Println("staticrobotid <ID>       - 设置机器人ID")
+			fmt.Println("statictype <类型>        - 设置机器人类型 (1: 英雄, 2: 工程, 3: 步兵, 4: 无人机, 5: 哨兵)")
+			fmt.Println("staticshooter <性能>     - 设置射手性能系统")
+			fmt.Println("staticchassis <性能>     - 设置底盘性能系统")
+			fmt.Println("staticlevel <等级>       - 设置机器人等级")
+			fmt.Println("staticmaxhp <血量>       - 设置最大血量")
+			fmt.Println("staticmaxheat <热量>     - 设置最大热量")
+			fmt.Println("staticheatrate <速率>    - 设置热量冷却速率")
+			fmt.Println("staticmaxpower <功率>    - 设置最大功率")
+			fmt.Println("staticmaxbuf <能量>      - 设置最大缓冲能量")
+			fmt.Println("staticmaxchassis <能量>  - 设置最大底盘能量")
+			fmt.Println("\nRobotDynamicStatus 参数:")
+			fmt.Println("dynhp <血量>             - 设置当前血量")
+			fmt.Println("dynheat <热量>           - 设置当前热量")
+			fmt.Println("dynfirerate <速率>       - 设置上次弹丸发射速率")
+			fmt.Println("dynchassis <能量>        - 设置当前底盘能量")
+			fmt.Println("dynbuffer <能量>         - 设置当前缓冲能量")
+			fmt.Println("dynexp <经验>            - 设置当前经验")
+			fmt.Println("dynexpup <经验>          - 设置升级所需经验")
+			fmt.Println("dynfired <数量>          - 设置总发射弹丸数")
+			fmt.Println("dynammo <数量>           - 设置剩余弹药")
+			fmt.Println("dynoutcombat <0/1>       - 设置是否脱离战斗 (0: 否, 1: 是)")
+			fmt.Println("dynoutcount <秒>         - 设置脱离战斗倒计时")
+			fmt.Println("startoutcombat <秒>      - 开始脱离战斗倒计时 (自动每秒递减)")
+			fmt.Println("stopoutcombat            - 停止脱离战斗倒计时")
+			fmt.Println("dynheal <0/1>            - 设置是否可以远程补血 (0: 否, 1: 是)")
+			fmt.Println("dynammoremote <0/1>      - 设置是否可以远程补弹 (0: 否, 1: 是)")
+			fmt.Println("\nPenaltyInfo 判罚信息参数:")
+			fmt.Println("penalty <类型>           - 模拟判罚")
+			fmt.Println("  1: 黄牌 (30秒)")
+			fmt.Println("  2: 双方黄牌 (30秒)")
+			fmt.Println("  3: 红牌 (120秒)")
+			fmt.Println("  4: 超功率 (10秒)")
+			fmt.Println("  5: 超热量 (10秒)")
+			fmt.Println("  6: 超射速 (10秒)")
+			fmt.Println("penaltytype <类型>       - 手动设置判罚类型 (0-6)")
+			fmt.Println("penaltyeffect <秒数>     - 手动设置判罚生效时长")
+			fmt.Println("penaltynum <次数>        - 手动设置总判罚次数")
+			fmt.Println("\nRobotPathPlanInfo 路径规划参数:")
+			fmt.Println("pathintent <意图>        - 设置路径规划意图类型")
+			fmt.Println("pathstart <X> <Y>        - 设置路径起始位置")
+			fmt.Println("pathsender <ID>          - 设置路径发送者ID")
+			fmt.Println("pathplan <意图> <起始X> <起始Y> <发送者ID> <偏移X列表> <偏移Y列表>")
+			fmt.Println("  - 一次性设置完整路径规划 (偏移列表用逗号分隔)")
+			fmt.Println("  示例: pathplan 1 100 200 5 10,20,30 15,25,35")
+			fmt.Println("\nRaderInfoToClient 雷达信息参数:")
+			fmt.Println("raderrobot <ID>                 - 设置雷达目标机器人ID")
+			fmt.Println("raderpos <X> <Y>                - 设置雷达目标位置 (浮点数)")
+			fmt.Println("raderangle <角度>               - 设置雷达朝向角度 (浮点数, 单位:度)")
+			fmt.Println("raderhighlight <0/1>            - 设置雷达是否高亮 (0: 否, 1: 是)")
+			fmt.Println("raderinfo <机器人ID> <X> <Y> <角度> <高亮0/1>")
+			fmt.Println("  - 一次性设置完整雷达信息")
+			fmt.Println("  示例: raderinfo 3 4.5 2.3 45.0 1")
+			fmt.Println("\nEvent 事件发送:")
+			fmt.Println("event <ID> [参数]        - 发送事件 (ID: 1-18)")
+			fmt.Println("  1: 击杀事件 (参数: 击杀者ID+被击毁机器人ID)")
+			fmt.Println("  2: 基地/前哨站被摧毁 (参数: 目标ID,如蓝方前哨站111)")
+			fmt.Println("  3: 能量机关可激活次数变化 (参数: 变化后可激活次数)")
+			fmt.Println("  4: 能量单元可进入激活状态 (无参数)")
+			fmt.Println("  5: 能量机关激活臂数/平均环数 (参数: 激活臂数+平均环数)")
+			fmt.Println("  6: 能量机关被激活 (参数: 激活类型)")
+			fmt.Println("  7: 己方英雄进入部署模式 (无参数)")
+			fmt.Println("  8: 己方英雄狙击伤害 (参数: 累计狙击伤害)")
+			fmt.Println("  9: 对方英雄狙击伤害 (参数: 累计狙击伤害)")
+			fmt.Println("  10: 己方呼叫空中支援 (无参数)")
+			fmt.Println("  11: 己方空中支援被打断 (参数: 对方剩余打断次数)")
+			fmt.Println("  12: 对方呼叫空中支援 (无参数)")
+			fmt.Println("  13: 对方空中支援被打断 (参数: 己方剩余打断次数)")
+			fmt.Println("  14: 飞镖命中 (参数: 1前哨站/2基地固定/3基地随机)")
+			fmt.Println("  15: 飞镖闸门开启 (参数: 1己方/2对方)")
+			fmt.Println("  16: 己方基地遭到攻击 (无参数)")
+			fmt.Println("  17: 前哨站停转 (参数: 1己方/2对方)")
+			fmt.Println("  18: 基地护甲展开 (参数: 1己方/2对方)")
+			fmt.Println("\nRobotPosition 参数:")
+			fmt.Println("position <X> <Y> <Z> <Yaw> - 设置机器人位置和朝向")
+			fmt.Println("  X, Y, Z: 三维坐标 (浮点数)")
+			fmt.Println("  Yaw: 偏航角/朝向 (浮点数, 单位:度)")
+			fmt.Println("\n飞镖系统:")
+			fmt.Println("dart <target_id>  - 启动飞镖系统")
+			fmt.Println("  target_id: 1=前哨站, 2=基地固定, 3=基地随机固定, 4=基地随机移动, 5=基地末端移动")
+			fmt.Println("dartstatus        - 显示飞镖系统状态")
+			fmt.Println("\nAssembly 装配系统参数:")
+			fmt.Println("assemblystatus              - 显示当前装配状态")
+			fmt.Println("assemblymax <等级>          - 设置最大装配难度等级 (1-4)")
+			fmt.Println("assemblystart <难度>        - 开始装配模拟 (难度: 1-4)")
+			fmt.Println("assemblycancel              - 取消当前装配")
+			fmt.Println("assemblyconfirm             - 在状态5时确认装配完成")
+			fmt.Println("\nAir Support 空中支援参数:")
+			fmt.Println("airsupportstatus            - 显示空中支援状态")
+			fmt.Println("airsupportfree <秒数>       - 设置免费时间")
+			fmt.Println("airsupportlock <0/1>        - 设置锁定状态 (0=解锁, 1=锁定)")
+			fmt.Println("airsupportstart <1/2>       - 启动空中支援 (1=免费, 2=付费)")
+			fmt.Println("  注: 付费模式会从 remainingEconomy 扣除金币 (1金币/秒)")
+			fmt.Println("  注: 金币为0且免费时间耗尽时,付费空中支援会被拒绝/强制结束")
+			fmt.Println("airsupportstop              - 中断空中支援")
+			fmt.Println("\nGlobalSpecialMechanism 堡垒占领计时:")
+			fmt.Println("bastionstart <0/1>          - 开始堡垒占领计时 (0=红方, 1=蓝方)")
+			fmt.Println("  注: 计时最大20秒,超过后自动归0")
+			fmt.Println("bastionstop <0/1>           - 停止堡垒占领计时 (0=红方, 1=蓝方)")
+			fmt.Println("bastionstatus               - 显示堡垒占领计时状态")
+			fmt.Println("\nRune 能量机关参数:")
+			fmt.Println("runestatus                  - 显示能量机关状态")
+			fmt.Println("runeactivate                - 手动触发能量机关激活")
+			fmt.Println("runeactivations <次数>      - 设置可激活次数")
+			fmt.Println("runefailprob <概率>         - 设置失败概率 (0.0-1.0, 默认0.1=10%)")
+			fmt.Println("runesetstatus <状态>        - 设置状态 (1=未激活, 2=正在激活, 3=已激活)")
+			fmt.Println("runesetarms <灯臂数>        - 设置已激活灯臂数 (0-5)")
+			fmt.Println("runesetrings <环数>         - 设置平均环数 (1-10)")
+			fmt.Println("runeset <灯臂数> <环数>     - 同时设置灯臂数和平均环数")
+			fmt.Println("runereset                   - 重置能量机关状态")
+			fmt.Println("runesync                    - 手动发送RuneStatusSync")
+			fmt.Println("\nstop              - 停止模拟器")
+			fmt.Println("=====================================\n")
+
+		case "status":
+			gs.printStatus()
+
+		case "pause":
+			gs.togglePause()
+
+		case "reset":
+			gs.resetMatch()
+
+		case "red":
+			if len(parts) < 2 {
+				fmt.Println("用法: red <分数>")
+				continue
+			}
+			score, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的分数: %s\n", parts[1])
+				continue
+			}
+			gs.setRedScore(uint32(score))
+
+		case "blue":
+			if len(parts) < 2 {
+				fmt.Println("用法: blue <分数>")
+				continue
+			}
+			score, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的分数: %s\n", parts[1])
+				continue
+			}
+			gs.setBlueScore(uint32(score))
+
+		case "round":
+			if len(parts) < 2 {
+				fmt.Println("用法: round <局号>")
+				continue
+			}
+			round, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的局号: %s\n", parts[1])
+				continue
+			}
+			gs.setCurrentRound(uint32(round))
+
+		case "total":
+			if len(parts) < 2 {
+				fmt.Println("用法: total <总局数>")
+				continue
+			}
+			total, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的总局数: %s\n", parts[1])
+				continue
+			}
+			gs.setTotalRounds(uint32(total))
+
+		case "stage":
+			if len(parts) < 2 {
+				fmt.Println("用法: stage <阶段> (0-5)")
+				continue
+			}
+			stage, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的阶段: %s\n", parts[1])
+				continue
+			}
+			gs.setStage(uint32(stage))
+
+		case "base":
+			if len(parts) < 2 {
+				fmt.Println("用法: base <血量>")
+				continue
+			}
+			health, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的血量: %s\n", parts[1])
+				continue
+			}
+			gs.setBaseHealth(uint32(health))
+
+		case "basestatus":
+			if len(parts) < 2 {
+				fmt.Println("用法: basestatus <状态>")
+				continue
+			}
+			status, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的状态: %s\n", parts[1])
+				continue
+			}
+			gs.setBaseStatus(uint32(status))
+
+		case "baseshield":
+			if len(parts) < 2 {
+				fmt.Println("用法: baseshield <护盾>")
+				continue
+			}
+			shield, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的护盾: %s\n", parts[1])
+				continue
+			}
+			gs.setBaseShield(uint32(shield))
+
+		case "outpost":
+			if len(parts) < 2 {
+				fmt.Println("用法: outpost <血量>")
+				continue
+			}
+			health, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的血量: %s\n", parts[1])
+				continue
+			}
+			gs.setOutpostHealth(uint32(health))
+
+		case "outpoststatus":
+			if len(parts) < 2 {
+				fmt.Println("用法: outpoststatus <状态>")
+				continue
+			}
+			status, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的状态: %s\n", parts[1])
+				continue
+			}
+			gs.setOutpostStatus(uint32(status))
+
+		case "robot":
+			if len(parts) < 3 {
+				fmt.Println("用法: robot <ID> <血量>")
+				continue
+			}
+			robotID, err := strconv.Atoi(parts[1])
+			if err != nil {
+				fmt.Printf("无效的机器人ID: %s\n", parts[1])
+				continue
+			}
+			health, err := strconv.ParseUint(parts[2], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的血量: %s\n", parts[2])
+				continue
+			}
+			gs.setRobotHealth(robotID, uint32(health))
+
+		case "bullets":
+			if len(parts) < 3 {
+				fmt.Println("用法: bullets <ID> <数量>")
+				continue
+			}
+			robotID, err := strconv.Atoi(parts[1])
+			if err != nil {
+				fmt.Printf("无效的机器人ID: %s\n", parts[1])
+				continue
+			}
+			bullets, err := strconv.ParseInt(parts[2], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的子弹数: %s\n", parts[2])
+				continue
+			}
+			gs.setRobotBullets(robotID, int32(bullets))
+
+		case "economy":
+			if len(parts) < 2 {
+				fmt.Println("用法: economy <数量>")
+				continue
+			}
+			economy, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的经济数量: %s\n", parts[1])
+				continue
+			}
+			gs.setRemainingEconomy(uint32(economy))
+
+		case "totaleco":
+			if len(parts) < 2 {
+				fmt.Println("用法: totaleco <数量>")
+				continue
+			}
+			economy, err := strconv.ParseUint(parts[1], 10, 64)
+			if err != nil {
+				fmt.Printf("无效的经济数量: %s\n", parts[1])
+				continue
+			}
+			gs.setTotalEconomyObtained(economy)
+
+		case "tech":
+			if len(parts) < 2 {
+				fmt.Println("用法: tech <等级>")
+				continue
+			}
+			level, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的科技等级: %s\n", parts[1])
+				continue
+			}
+			gs.setTechLevel(uint32(level))
+
+		case "encrypt":
+			if len(parts) < 2 {
+				fmt.Println("用法: encrypt <等级>")
+				continue
+			}
+			level, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的加密等级: %s\n", parts[1])
+				continue
+			}
+			gs.setEncryptionLevel(uint32(level))
+
+		case "damagered":
+			if len(parts) < 2 {
+				fmt.Println("用法: damagered <伤害>")
+				continue
+			}
+			damage, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的伤害值: %s\n", parts[1])
+				continue
+			}
+			gs.setTotalDamageRed(uint32(damage))
+
+		case "damageblue":
+			if len(parts) < 2 {
+				fmt.Println("用法: damageblue <伤害>")
+				continue
+			}
+			damage, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的伤害值: %s\n", parts[1])
+				continue
+			}
+			gs.setTotalDamageBlue(uint32(damage))
+
+		case "powermanager":
+			if len(parts) < 2 {
+				fmt.Println("用法: powermanager <状态>")
+				continue
+			}
+			status, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的状态值: %s\n", parts[1])
+				continue
+			}
+			gs.setPowerManager(uint32(status))
+
+		case "rfid":
+			if len(parts) < 2 {
+				fmt.Println("用法: rfid <状态>")
+				continue
+			}
+			status, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的状态值: %s\n", parts[1])
+				continue
+			}
+			gs.setRfid(uint32(status))
+
+		case "lightstrip":
+			if len(parts) < 2 {
+				fmt.Println("用法: lightstrip <状态>")
+				continue
+			}
+			status, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的状态值: %s\n", parts[1])
+				continue
+			}
+			gs.setLightStrip(uint32(status))
+
+		case "smallshooter":
+			if len(parts) < 2 {
+				fmt.Println("用法: smallshooter <状态>")
+				continue
+			}
+			status, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的状态值: %s\n", parts[1])
+				continue
+			}
+			gs.setSmallShooter(uint32(status))
+
+		case "bigshooter":
+			if len(parts) < 2 {
+				fmt.Println("用法: bigshooter <状态>")
+				continue
+			}
+			status, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的状态值: %s\n", parts[1])
+				continue
+			}
+			gs.setBigShooter(uint32(status))
+
+		case "uwb":
+			if len(parts) < 2 {
+				fmt.Println("用法: uwb <状态>")
+				continue
+			}
+			status, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的状态值: %s\n", parts[1])
+				continue
+			}
+			gs.setUwb(uint32(status))
+
+		case "armor":
+			if len(parts) < 2 {
+				fmt.Println("用法: armor <状态>")
+				continue
+			}
+			status, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的状态值: %s\n", parts[1])
+				continue
+			}
+			gs.setArmor(uint32(status))
+
+		case "videotrans":
+			if len(parts) < 2 {
+				fmt.Println("用法: videotrans <状态>")
+				continue
+			}
+			status, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的状态值: %s\n", parts[1])
+				continue
+			}
+			gs.setVideoTransmission(uint32(status))
+
+		case "capacitor":
+			if len(parts) < 2 {
+				fmt.Println("用法: capacitor <状态>")
+				continue
+			}
+			status, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的状态值: %s\n", parts[1])
+				continue
+			}
+			gs.setCapacitor(uint32(status))
+
+		case "mainctrl":
+			if len(parts) < 2 {
+				fmt.Println("用法: mainctrl <状态>")
+				continue
+			}
+			status, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的状态值: %s\n", parts[1])
+				continue
+			}
+			gs.setMainController(uint32(status))
+
+		case "respawnpending":
+			if len(parts) < 2 {
+				fmt.Println("用法: respawnpending <0/1>")
+				continue
+			}
+			pending, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的值: %s\n", parts[1])
+				continue
+			}
+			gs.setIsPendingRespawn(pending != 0)
+
+		case "respawntotal":
+			if len(parts) < 2 {
+				fmt.Println("用法: respawntotal <进度>")
+				continue
+			}
+			progress, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的进度值: %s\n", parts[1])
+				continue
+			}
+			gs.setTotalRespawnProgress(uint32(progress))
+
+		case "respawncurrent":
+			if len(parts) < 2 {
+				fmt.Println("用法: respawncurrent <进度>")
+				continue
+			}
+			progress, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的进度值: %s\n", parts[1])
+				continue
+			}
+			gs.setCurrentRespawnProgress(uint32(progress))
+
+		case "respawnfree":
+			if len(parts) < 2 {
+				fmt.Println("用法: respawnfree <0/1>")
+				continue
+			}
+			canFree, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的值: %s\n", parts[1])
+				continue
+			}
+			gs.setCanFreeRespawn(canFree != 0)
+
+		case "respawncost":
+			if len(parts) < 2 {
+				fmt.Println("用法: respawncost <金币>")
+				continue
+			}
+			cost, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的金币值: %s\n", parts[1])
+				continue
+			}
+			gs.setGoldCostForRespawn(uint32(cost))
+
+		case "respawnpay":
+			if len(parts) < 2 {
+				fmt.Println("用法: respawnpay <0/1>")
+				continue
+			}
+			canPay, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的值: %s\n", parts[1])
+				continue
+			}
+			gs.setCanPayForRespawn(canPay != 0)
+
+		case "injurytotal":
+			if len(parts) < 2 {
+				fmt.Println("用法: injurytotal <伤害>")
+				continue
+			}
+			damage, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的伤害值: %s\n", parts[1])
+				continue
+			}
+			gs.setInjuryTotalDamage(uint32(damage))
+
+		case "injurycollision":
+			if len(parts) < 2 {
+				fmt.Println("用法: injurycollision <伤害>")
+				continue
+			}
+			damage, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的伤害值: %s\n", parts[1])
+				continue
+			}
+			gs.setInjuryCollisionDamage(uint32(damage))
+
+		case "injurysmall":
+			if len(parts) < 2 {
+				fmt.Println("用法: injurysmall <伤害>")
+				continue
+			}
+			damage, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的伤害值: %s\n", parts[1])
+				continue
+			}
+			gs.setInjurySmallProjectileDamage(uint32(damage))
+
+		case "injurylarge":
+			if len(parts) < 2 {
+				fmt.Println("用法: injurylarge <伤害>")
+				continue
+			}
+			damage, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的伤害值: %s\n", parts[1])
+				continue
+			}
+			gs.setInjuryLargeProjectileDamage(uint32(damage))
+
+		case "injurydart":
+			if len(parts) < 2 {
+				fmt.Println("用法: injurydart <伤害>")
+				continue
+			}
+			damage, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的伤害值: %s\n", parts[1])
+				continue
+			}
+			gs.setInjuryDartSplashDamage(uint32(damage))
+
+		case "injurymodule":
+			if len(parts) < 2 {
+				fmt.Println("用法: injurymodule <伤害>")
+				continue
+			}
+			damage, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的伤害值: %s\n", parts[1])
+				continue
+			}
+			gs.setInjuryModuleOfflineDamage(uint32(damage))
+
+		case "injurywifi":
+			if len(parts) < 2 {
+				fmt.Println("用法: injurywifi <伤害>")
+				continue
+			}
+			damage, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的伤害值: %s\n", parts[1])
+				continue
+			}
+			gs.setInjuryWifiOfflineDamage(uint32(damage))
+
+		case "injurypenalty":
+			if len(parts) < 2 {
+				fmt.Println("用法: injurypenalty <伤害>")
+				continue
+			}
+			damage, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的伤害值: %s\n", parts[1])
+				continue
+			}
+			gs.setInjuryPenaltyDamage(uint32(damage))
+
+		case "injuryserver":
+			if len(parts) < 2 {
+				fmt.Println("用法: injuryserver <伤害>")
+				continue
+			}
+			damage, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的伤害值: %s\n", parts[1])
+				continue
+			}
+			gs.setInjuryServerKillDamage(uint32(damage))
+
+		case "injurykiller":
+			if len(parts) < 2 {
+				fmt.Println("用法: injurykiller <ID>")
+				continue
+			}
+			killerID, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的ID值: %s\n", parts[1])
+				continue
+			}
+			gs.setInjuryKillerId(uint32(killerID))
+
+		case "staticconn":
+			if len(parts) < 2 {
+				fmt.Println("用法: staticconn <状态>")
+				continue
+			}
+			state, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的状态值: %s\n", parts[1])
+				continue
+			}
+			gs.setStaticConnectionState(uint32(state))
+
+		case "staticfield":
+			if len(parts) < 2 {
+				fmt.Println("用法: staticfield <状态>")
+				continue
+			}
+			state, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的状态值: %s\n", parts[1])
+				continue
+			}
+			gs.setStaticFieldState(uint32(state))
+
+		case "staticalive":
+			if len(parts) < 2 {
+				fmt.Println("用法: staticalive <状态>")
+				continue
+			}
+			state, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的状态值: %s\n", parts[1])
+				continue
+			}
+			gs.setStaticAliveState(uint32(state))
+
+		case "staticrobotid":
+			if len(parts) < 2 {
+				fmt.Println("用法: staticrobotid <ID>")
+				continue
+			}
+			id, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的ID值: %s\n", parts[1])
+				continue
+			}
+			gs.setStaticRobotId(uint32(id))
+
+		case "statictype":
+			if len(parts) < 2 {
+				fmt.Println("用法: statictype <类型>")
+				continue
+			}
+			robotType, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的类型值: %s\n", parts[1])
+				continue
+			}
+			gs.setStaticRobotType(uint32(robotType))
+
+		case "staticshooter":
+			if len(parts) < 2 {
+				fmt.Println("用法: staticshooter <性能>")
+				continue
+			}
+			perf, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的性能值: %s\n", parts[1])
+				continue
+			}
+			gs.setStaticPerformanceSystemShooter(uint32(perf))
+
+		case "staticchassis":
+			if len(parts) < 2 {
+				fmt.Println("用法: staticchassis <性能>")
+				continue
+			}
+			perf, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的性能值: %s\n", parts[1])
+				continue
+			}
+			gs.setStaticPerformanceSystemChassis(uint32(perf))
+
+		case "staticlevel":
+			if len(parts) < 2 {
+				fmt.Println("用法: staticlevel <等级>")
+				continue
+			}
+			level, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的等级值: %s\n", parts[1])
+				continue
+			}
+			gs.setStaticLevel(uint32(level))
+
+		case "staticmaxhp":
+			if len(parts) < 2 {
+				fmt.Println("用法: staticmaxhp <血量>")
+				continue
+			}
+			health, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的血量值: %s\n", parts[1])
+				continue
+			}
+			gs.setStaticMaxHealth(uint32(health))
+
+		case "staticmaxheat":
+			if len(parts) < 2 {
+				fmt.Println("用法: staticmaxheat <热量>")
+				continue
+			}
+			heat, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的热量值: %s\n", parts[1])
+				continue
+			}
+			gs.setStaticMaxHeat(uint32(heat))
+
+		case "staticheatrate":
+			if len(parts) < 2 {
+				fmt.Println("用法: staticheatrate <速率>")
+				continue
+			}
+			rate, err := strconv.ParseFloat(parts[1], 32)
+			if err != nil {
+				fmt.Printf("无效的速率值: %s\n", parts[1])
+				continue
+			}
+			gs.setStaticHeatCooldownRate(float32(rate))
+
+		case "staticmaxpower":
+			if len(parts) < 2 {
+				fmt.Println("用法: staticmaxpower <功率>")
+				continue
+			}
+			power, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的功率值: %s\n", parts[1])
+				continue
+			}
+			gs.setStaticMaxPower(uint32(power))
+
+		case "staticmaxbuf":
+			if len(parts) < 2 {
+				fmt.Println("用法: staticmaxbuf <能量>")
+				continue
+			}
+			energy, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的能量值: %s\n", parts[1])
+				continue
+			}
+			gs.setStaticMaxBufferEnergy(uint32(energy))
+
+		case "staticmaxchassis":
+			if len(parts) < 2 {
+				fmt.Println("用法: staticmaxchassis <能量>")
+				continue
+			}
+			energy, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的能量值: %s\n", parts[1])
+				continue
+			}
+			gs.setStaticMaxChassisEnergy(uint32(energy))
+
+		case "dynhp":
+			if len(parts) < 2 {
+				fmt.Println("用法: dynhp <血量>")
+				continue
+			}
+			health, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的血量值: %s\n", parts[1])
+				continue
+			}
+			gs.setDynamicCurrentHealth(uint32(health))
+
+		case "dynheat":
+			if len(parts) < 2 {
+				fmt.Println("用法: dynheat <热量>")
+				continue
+			}
+			heat, err := strconv.ParseFloat(parts[1], 32)
+			if err != nil {
+				fmt.Printf("无效的热量值: %s\n", parts[1])
+				continue
+			}
+			gs.setDynamicCurrentHeat(float32(heat))
+
+		case "dynfirerate":
+			if len(parts) < 2 {
+				fmt.Println("用法: dynfirerate <速率>")
+				continue
+			}
+			rate, err := strconv.ParseFloat(parts[1], 32)
+			if err != nil {
+				fmt.Printf("无效的速率值: %s\n", parts[1])
+				continue
+			}
+			gs.setDynamicLastProjectileFireRate(float32(rate))
+
+		case "dynchassis":
+			if len(parts) < 2 {
+				fmt.Println("用法: dynchassis <能量>")
+				continue
+			}
+			energy, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的能量值: %s\n", parts[1])
+				continue
+			}
+			gs.setDynamicCurrentChassisEnergy(uint32(energy))
+
+		case "dynbuffer":
+			if len(parts) < 2 {
+				fmt.Println("用法: dynbuffer <能量>")
+				continue
+			}
+			energy, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的能量值: %s\n", parts[1])
+				continue
+			}
+			gs.setDynamicCurrentBufferEnergy(uint32(energy))
+
+		case "dynexp":
+			if len(parts) < 2 {
+				fmt.Println("用法: dynexp <经验>")
+				continue
+			}
+			exp, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的经验值: %s\n", parts[1])
+				continue
+			}
+			gs.setDynamicCurrentExperience(uint32(exp))
+
+		case "dynexpup":
+			if len(parts) < 2 {
+				fmt.Println("用法: dynexpup <经验>")
+				continue
+			}
+			exp, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的经验值: %s\n", parts[1])
+				continue
+			}
+			gs.setDynamicExperienceForUpgrade(uint32(exp))
+
+		case "dynfired":
+			if len(parts) < 2 {
+				fmt.Println("用法: dynfired <数量>")
+				continue
+			}
+			count, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的数量值: %s\n", parts[1])
+				continue
+			}
+			gs.setDynamicTotalProjectilesFired(uint32(count))
+
+		case "dynammo":
+			if len(parts) < 2 {
+				fmt.Println("用法: dynammo <数量>")
+				continue
+			}
+			ammo, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的数量值: %s\n", parts[1])
+				continue
+			}
+			gs.setDynamicRemainingAmmo(uint32(ammo))
+
+		case "dynoutcombat":
+			if len(parts) < 2 {
+				fmt.Println("用法: dynoutcombat <0/1>")
+				continue
+			}
+			isOut, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的值: %s\n", parts[1])
+				continue
+			}
+			gs.setDynamicIsOutOfCombat(isOut != 0)
+
+		case "dynoutcount":
+			if len(parts) < 2 {
+				fmt.Println("用法: dynoutcount <秒>")
+				continue
+			}
+			countdown, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的倒计时值: %s\n", parts[1])
+				continue
+			}
+			gs.setDynamicOutOfCombatCountdown(uint32(countdown))
+
+		case "startoutcombat":
+			if len(parts) < 2 {
+				fmt.Println("用法: startoutcombat <秒>")
+				continue
+			}
+			seconds, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的秒数: %s\n", parts[1])
+				continue
+			}
+			if seconds == 0 {
+				fmt.Println("秒数必须大于0")
+				continue
+			}
+			gs.startOutOfCombatCountdown(uint32(seconds))
+			fmt.Printf("✓ 已开始脱离战斗倒计时: %d秒\n", seconds)
+
+		case "stopoutcombat":
+			gs.stopOutOfCombatCountdown()
+			fmt.Println("✓ 已停止脱离战斗倒计时")
+
+		case "dynheal":
+			if len(parts) < 2 {
+				fmt.Println("用法: dynheal <0/1>")
+				continue
+			}
+			canHeal, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的值: %s\n", parts[1])
+				continue
+			}
+			gs.setDynamicCanRemoteHeal(canHeal != 0)
+
+		case "dynammoremote":
+			if len(parts) < 2 {
+				fmt.Println("用法: dynammoremote <0/1>")
+				continue
+			}
+			canAmmo, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的值: %s\n", parts[1])
+				continue
+			}
+			gs.setDynamicCanRemoteAmmo(canAmmo != 0)
+
+		case "event":
+			if len(parts) < 2 {
+				fmt.Println("用法: event <ID> [参数]")
+				continue
+			}
+			eventID, err := strconv.ParseInt(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的事件ID: %s\n", parts[1])
+				continue
+			}
+			if eventID < 1 || eventID > 18 {
+				fmt.Printf("事件ID超出范围: %d (有效范围: 1-18)\n", eventID)
+				continue
+			}
+
+			// 获取参数(如果有)
+			param := ""
+			if len(parts) >= 3 {
+				param = parts[2]
+			}
+
+			// 创建Event消息
+			event := &rmcp.Event{
+				EventId: int32(eventID),
+				Param:   param,
+			}
+
+			// 序列化并发布
+			out, err := proto.Marshal(event)
+			if err != nil {
+				fmt.Printf("Event序列化失败: %v\n", err)
+				continue
+			}
+
+			err = server.Publish("Event", out, false, 0)
+			if err != nil {
+				fmt.Printf("Event发布失败: %v\n", err)
+				continue
+			}
+
+			logrus.Infof("已发送Event: ID=%d, Param=%s", eventID, param)
+			fmt.Printf("✓ 已发送Event: ID=%d, Param=%s\n", eventID, param)
+
+		case "startrespawn":
+			if len(parts) < 3 {
+				fmt.Println("用法: startrespawn <免费0/1> <付费0/1>")
+				continue
+			}
+			canFree, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的免费复活值: %s\n", parts[1])
+				continue
+			}
+			canPay, err := strconv.ParseUint(parts[2], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的付费复活值: %s\n", parts[2])
+				continue
+			}
+			gs.startRespawnSimulation(canFree != 0, canPay != 0)
+			fmt.Printf("✓ 已开始复活倒计时模拟 (免费复活: %v, 金币复活: %v)\n", canFree != 0, canPay != 0)
+
+		case "stoprespawn":
+			gs.stopRespawnSimulation()
+			fmt.Println("✓ 已停止复活倒计时模拟")
+
+		case "position":
+			if len(parts) < 5 {
+				fmt.Println("用法: position <X> <Y> <Z> <Yaw>")
+				continue
+			}
+			x, err := strconv.ParseFloat(parts[1], 32)
+			if err != nil {
+				fmt.Printf("无效的X坐标: %s\n", parts[1])
+				continue
+			}
+			y, err := strconv.ParseFloat(parts[2], 32)
+			if err != nil {
+				fmt.Printf("无效的Y坐标: %s\n", parts[2])
+				continue
+			}
+			z, err := strconv.ParseFloat(parts[3], 32)
+			if err != nil {
+				fmt.Printf("无效的Z坐标: %s\n", parts[3])
+				continue
+			}
+			yaw, err := strconv.ParseFloat(parts[4], 32)
+			if err != nil {
+				fmt.Printf("无效的Yaw朝向: %s\n", parts[4])
+				continue
+			}
+			gs.setRobotPosition(float32(x), float32(y), float32(z), float32(yaw))
+			fmt.Printf("✓ 机器人位置已设置为: X=%.2f, Y=%.2f, Z=%.2f, Yaw=%.2f°\n", x, y, z, yaw)
+
+		case "penalty":
+			if len(parts) < 2 {
+				fmt.Println("用法: penalty <类型>")
+				fmt.Println("  1: 黄牌 (30秒)")
+				fmt.Println("  2: 双方黄牌 (30秒)")
+				fmt.Println("  3: 红牌 (120秒)")
+				fmt.Println("  4: 超功率 (10秒)")
+				fmt.Println("  5: 超热量 (10秒)")
+				fmt.Println("  6: 超射速 (10秒)")
+				continue
+			}
+			penaltyType, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的判罚类型: %s\n", parts[1])
+				continue
+			}
+			if penaltyType < 1 || penaltyType > 6 {
+				fmt.Printf("判罚类型超出范围: %d (有效范围: 1-6)\n", penaltyType)
+				continue
+			}
+			gs.simulatePenalty(uint32(penaltyType))
+			fmt.Printf("✓ 已模拟判罚: 类型=%d\n", penaltyType)
+
+		case "penaltytype":
+			if len(parts) < 2 {
+				fmt.Println("用法: penaltytype <类型>")
+				continue
+			}
+			penaltyType, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的判罚类型: %s\n", parts[1])
+				continue
+			}
+			gs.setPenaltyType(uint32(penaltyType))
+			fmt.Printf("✓ 判罚类型已设置为: %d\n", penaltyType)
+
+		case "penaltyeffect":
+			if len(parts) < 2 {
+				fmt.Println("用法: penaltyeffect <秒数>")
+				continue
+			}
+			effectSec, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的秒数: %s\n", parts[1])
+				continue
+			}
+			gs.setPenaltyEffectSec(uint32(effectSec))
+			fmt.Printf("✓ 判罚生效时长已设置为: %d秒\n", effectSec)
+
+		case "penaltynum":
+			if len(parts) < 2 {
+				fmt.Println("用法: penaltynum <次数>")
+				continue
+			}
+			totalNum, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的次数: %s\n", parts[1])
+				continue
+			}
+			gs.setTotalPenaltyNum(uint32(totalNum))
+			fmt.Printf("✓ 总判罚次数已设置为: %d\n", totalNum)
+
+		case "pathintent":
+			if len(parts) < 2 {
+				fmt.Println("用法: pathintent <意图>")
+				continue
+			}
+			intention, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的意图值: %s\n", parts[1])
+				continue
+			}
+			gs.setPathIntention(uint32(intention))
+			fmt.Printf("✓ 路径规划意图已设置为: %d\n", intention)
+
+		case "pathstart":
+			if len(parts) < 3 {
+				fmt.Println("用法: pathstart <X> <Y>")
+				continue
+			}
+			x, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的X坐标: %s\n", parts[1])
+				continue
+			}
+			y, err := strconv.ParseUint(parts[2], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的Y坐标: %s\n", parts[2])
+				continue
+			}
+			gs.setPathStartPos(uint32(x), uint32(y))
+			fmt.Printf("✓ 路径起始位置已设置为: X=%d, Y=%d\n", x, y)
+
+		case "pathsender":
+			if len(parts) < 2 {
+				fmt.Println("用法: pathsender <ID>")
+				continue
+			}
+			senderId, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的发送者ID: %s\n", parts[1])
+				continue
+			}
+			gs.setPathSenderId(uint32(senderId))
+			fmt.Printf("✓ 路径发送者ID已设置为: %d\n", senderId)
+
+		case "pathplan":
+			if len(parts) < 7 {
+				fmt.Println("用法: pathplan <意图> <起始X> <起始Y> <发送者ID> <偏移X列表> <偏移Y列表>")
+				fmt.Println("示例: pathplan 1 100 200 5 10,20,30 15,25,35")
+				continue
+			}
+			intention, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的意图值: %s\n", parts[1])
+				continue
+			}
+			startX, err := strconv.ParseUint(parts[2], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的起始X坐标: %s\n", parts[2])
+				continue
+			}
+			startY, err := strconv.ParseUint(parts[3], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的起始Y坐标: %s\n", parts[3])
+				continue
+			}
+			senderId, err := strconv.ParseUint(parts[4], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的发送者ID: %s\n", parts[4])
+				continue
+			}
+
+			// 解析偏移X列表
+			offsetXStrs := strings.Split(parts[5], ",")
+			offsetX := make([]int32, len(offsetXStrs))
+			for i, s := range offsetXStrs {
+				val, err := strconv.ParseInt(strings.TrimSpace(s), 10, 32)
+				if err != nil {
+					fmt.Printf("无效的X偏移值: %s\n", s)
+					continue
+				}
+				offsetX[i] = int32(val)
+			}
+
+			// 解析偏移Y列表
+			offsetYStrs := strings.Split(parts[6], ",")
+			offsetY := make([]int32, len(offsetYStrs))
+			for i, s := range offsetYStrs {
+				val, err := strconv.ParseInt(strings.TrimSpace(s), 10, 32)
+				if err != nil {
+					fmt.Printf("无效的Y偏移值: %s\n", s)
+					continue
+				}
+				offsetY[i] = int32(val)
+			}
+
+			gs.setPathPlan(uint32(intention), uint32(startX), uint32(startY), uint32(senderId), offsetX, offsetY)
+			fmt.Printf("✓ 路径规划已设置: 意图=%d, 起始位置=(%d,%d), 发送者=%d, 路径点数=%d\n",
+				intention, startX, startY, senderId, len(offsetX))
+
+		case "raderrobot":
+			if len(parts) < 2 {
+				fmt.Println("用法: raderrobot <ID>")
+				continue
+			}
+			robotId, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的机器人ID: %s\n", parts[1])
+				continue
+			}
+			gs.setRaderTargetRobotId(uint32(robotId))
+			fmt.Printf("✓ 雷达目标机器人ID已设置为: %d\n", robotId)
+
+		case "raderpos":
+			if len(parts) < 3 {
+				fmt.Println("用法: raderpos <X> <Y>")
+				continue
+			}
+			x, err := strconv.ParseFloat(parts[1], 32)
+			if err != nil {
+				fmt.Printf("无效的X坐标: %s\n", parts[1])
+				continue
+			}
+			y, err := strconv.ParseFloat(parts[2], 32)
+			if err != nil {
+				fmt.Printf("无效的Y坐标: %s\n", parts[2])
+				continue
+			}
+			gs.setRaderTargetPos(float32(x), float32(y))
+			fmt.Printf("✓ 雷达目标位置已设置为: X=%.2f, Y=%.2f\n", x, y)
+
+		case "raderangle":
+			if len(parts) < 2 {
+				fmt.Println("用法: raderangle <角度>")
+				continue
+			}
+			angle, err := strconv.ParseFloat(parts[1], 32)
+			if err != nil {
+				fmt.Printf("无效的角度值: %s\n", parts[1])
+				continue
+			}
+			gs.setRaderTorwardAngle(float32(angle))
+			fmt.Printf("✓ 雷达朝向角度已设置为: %.2f°\n", angle)
+
+		case "raderhighlight":
+			if len(parts) < 2 {
+				fmt.Println("用法: raderhighlight <0/1>")
+				continue
+			}
+			isHighLight, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的高亮值: %s\n", parts[1])
+				continue
+			}
+			gs.setRaderIsHighLight(uint32(isHighLight))
+			fmt.Printf("✓ 雷达高亮状态已设置为: %d\n", isHighLight)
+
+		case "raderinfo":
+			if len(parts) < 6 {
+				fmt.Println("用法: raderinfo <机器人ID> <X> <Y> <角度> <高亮0/1>")
+				fmt.Println("示例: raderinfo 3 4.5 2.3 45.0 1")
+				continue
+			}
+			robotId, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的机器人ID: %s\n", parts[1])
+				continue
+			}
+			posX, err := strconv.ParseFloat(parts[2], 32)
+			if err != nil {
+				fmt.Printf("无效的X坐标: %s\n", parts[2])
+				continue
+			}
+			posY, err := strconv.ParseFloat(parts[3], 32)
+			if err != nil {
+				fmt.Printf("无效的Y坐标: %s\n", parts[3])
+				continue
+			}
+			angle, err := strconv.ParseFloat(parts[4], 32)
+			if err != nil {
+				fmt.Printf("无效的角度值: %s\n", parts[4])
+				continue
+			}
+			isHighLight, err := strconv.ParseUint(parts[5], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的高亮值: %s\n", parts[5])
+				continue
+			}
+			gs.setRaderInfo(uint32(robotId), float32(posX), float32(posY), float32(angle), uint32(isHighLight))
+			fmt.Printf("✓ 雷达信息已设置: 目标机器人=%d, 位置=(%.2f,%.2f), 角度=%.2f°, 高亮=%d\n",
+				robotId, posX, posY, angle, isHighLight)
+
+		case "dart":
+			if len(parts) < 2 {
+				fmt.Println("用法: dart <target_id>")
+				fmt.Println("  target_id: 1=前哨站, 2=基地固定, 3=基地随机固定, 4=基地随机移动, 5=基地末端移动")
+				continue
+			}
+			targetId, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的 target_id: %s\n", parts[1])
+				continue
+			}
+			if targetId < 1 || targetId > 5 {
+				fmt.Printf("target_id 超出范围: %d (有效范围: 1-5)\n", targetId)
+				continue
+			}
+
+			// 调用 handleDartCommand 模拟 MQTT 指令
+			shouldSend := gs.handleDartCommand(uint32(targetId), true)
+			if shouldSend {
+				// 手动发送状态同步（切换指令会返回 true）
+				status := gs.getDartStatus()
+				out, err := proto.Marshal(status)
+				if err == nil {
+					err = server.Publish("DartSelectTargetStatusSync", out, false, 0)
+					if err == nil {
+						fmt.Printf("✓ 飞镖系统已启动: target_id=%d, 已发送状态同步\n", targetId)
+					} else {
+						fmt.Printf("✗ 发送状态同步失败: %v\n", err)
+					}
+				}
+			} else {
+				// 检查是否是开启指令成功（不立即发送状态同步）
+				gs.mu.RLock()
+				if gs.dartState == 1 && gs.dartTargetId == uint32(targetId) {
+					// 开启指令成功，等待7秒后发送 open=1
+					gs.mu.RUnlock()
+					fmt.Printf("✓ 飞镖系统已启动: target_id=%d, 等待7秒后发送闸门开启信号\n", targetId)
+				} else {
+					gs.mu.RUnlock()
+					fmt.Printf("✗ 飞镖指令被拒绝 (可能处于忙碌状态或参数无效)\n")
+				}
+			}
+
+		case "dartstatus":
+			gs.mu.RLock()
+			stateNames := map[uint32]string{
+				0: "IDLE (空闲)",
+				1: "OPENING (准备开启，等待7秒)",
+				2: "OPEN_READY (闸门已开启，等待发射)",
+				3: "COOLDOWN (冷却中)",
+				4: "SWITCHING (切换中)",
+			}
+			stateName := stateNames[gs.dartState]
+			elapsed := time.Since(gs.dartStateStartTime).Seconds()
+			switchCooldown := gs.dartSwitchCooldownActive
+			nextTargetId := gs.dartNextTargetId
+			gs.mu.RUnlock()
+
+			fmt.Println("\n========== 飞镖系统状态 ==========")
+			fmt.Printf("状态: %s\n", stateName)
+			if gs.dartState == 4 {
+				// 切换中，显示下一个目标ID
+				fmt.Printf("当前目标ID: %d (切换中)\n", gs.dartTargetId)
+				fmt.Printf("切换至目标ID: %d\n", nextTargetId)
+			} else {
+				fmt.Printf("目标ID: %d\n", gs.dartTargetId)
+			}
+			if switchCooldown {
+				fmt.Printf("切换冷却: 激活中 (%.1f 秒后解除)\n", 1.0-elapsed)
+			}
+			if gs.dartState != 0 {
+				fmt.Printf("当前状态耗时: %.1f 秒\n", elapsed)
+				if gs.dartState == 1 {
+					fmt.Printf("预计闸门开启信号发送: %.1f 秒后\n", 7.0-elapsed)
+				} else if gs.dartState == 2 {
+					fmt.Printf("预计飞镖发射: %.1f 秒后\n", 15.0-elapsed)
+				} else if gs.dartState == 3 {
+					fmt.Printf("预计冷却完成: %.1f 秒后\n", 15.0-elapsed)
+				} else if gs.dartState == 4 {
+					fmt.Printf("预计切换完成: %.1f 秒后\n", 1.0-elapsed)
+				}
+			}
+			fmt.Println("==================================\n")
+
+		case "assemblystatus":
+			gs.mu.RLock()
+			stateNames := map[uint32]string{
+				0: "IDLE (空闲/未装配)",
+				1: "IDLE (等待新装配)",
+				2: "科技核心移动中",
+				3: "科技核心到位,可进行首个装配步骤",
+				4: "上一个装配步骤已完成,可进行下一个步骤",
+				5: "装配步骤已全部完成,等待确认",
+				6: "已确认装配,科技核心返回中",
+			}
+			stateName := stateNames[gs.assemblyState]
+			difficulty := gs.assemblyDifficulty
+			maxDifficulty := gs.assemblyMaxDifficulty
+			level4Cooldown := gs.assemblyLevel4Cooldown
+			elapsed := time.Since(gs.assemblyStepStartTime).Seconds()
+			gs.mu.RUnlock()
+
+			fmt.Println("\n========== 装配系统状态 ==========")
+			fmt.Printf("状态: %s\n", stateName)
+			fmt.Printf("当前装配难度: %d\n", difficulty)
+			fmt.Printf("最大允许难度: %d\n", maxDifficulty)
+			if level4Cooldown {
+				fmt.Println("四级装配冷却: 激活中 (90秒冷却)")
+			} else {
+				fmt.Println("四级装配冷却: 未激活")
+			}
+			if gs.assemblyState != 0 {
+				fmt.Printf("当前状态耗时: %.1f 秒\n", elapsed)
+			}
+			fmt.Println("==================================\n")
+
+		case "assemblymax":
+			if len(parts) < 2 {
+				fmt.Println("用法: assemblymax <等级>")
+				fmt.Println("  等级: 1-4 (最大允许装配难度)")
+				continue
+			}
+			level, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil || level < 1 || level > 4 {
+				fmt.Println("✗ 参数错误: 等级必须为1-4之间的整数")
+				continue
+			}
+			gs.mu.Lock()
+			gs.assemblyMaxDifficulty = uint32(level)
+			gs.mu.Unlock()
+			fmt.Printf("✓ 最大装配难度已设置为: %d\n", level)
+
+		case "assemblystart":
+			if len(parts) < 2 {
+				fmt.Println("用法: assemblystart <难度>")
+				fmt.Println("  难度: 1-4")
+				continue
+			}
+			difficulty, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil || difficulty < 1 || difficulty > 4 {
+				fmt.Println("✗ 参数错误: 难度必须为1-4之间的整数")
+				continue
+			}
+			gs.mu.Lock()
+			// 直接调用 startAssemblyProcess (已持有锁)
+			if gs.assemblyState == 0 {
+				if uint32(difficulty) == 4 && gs.assemblyLevel4Cooldown {
+					fmt.Println("✗ 四级装配冷却中,无法启动")
+					gs.mu.Unlock()
+					continue
+				}
+				if uint32(difficulty) > gs.assemblyMaxDifficulty {
+					fmt.Printf("✗ 难度超过最大值 (max=%d)\n", gs.assemblyMaxDifficulty)
+					gs.mu.Unlock()
+					continue
+				}
+				gs.startAssemblyProcess(uint32(difficulty))
+				gs.mu.Unlock()
+				fmt.Printf("✓ 装配已启动: 难度=%d\n", difficulty)
+			} else {
+				gs.mu.Unlock()
+				fmt.Println("✗ 装配已在进行中,请先取消当前装配")
+			}
+
+		case "assemblycancel":
+			gs.mu.Lock()
+			if gs.assemblyState != 0 {
+				gs.stopAssemblyProcess()
+				gs.assemblyState = 1
+				gs.mu.Unlock()
+				fmt.Println("✓ 装配已取消")
+			} else {
+				gs.mu.Unlock()
+				fmt.Println("✗ 当前没有装配在进行中")
+			}
+
+		case "assemblyconfirm":
+			gs.mu.Lock()
+			if gs.assemblyState == 5 {
+				// 停止四级超时计时器（如果存在）
+				if gs.assemblyStepTimer != nil {
+					gs.assemblyStepTimer.Stop()
+					gs.assemblyStepTimer = nil
+				}
+
+				// 记录当前装配难度
+				completedDifficulty := gs.assemblyDifficulty
+				gs.assemblyState = 6
+				fmt.Println("✓ 装配已确认,科技核心返回中 (5秒后完成)")
+
+				// 5秒后返回空闲状态
+				gs.assemblyStepTimer = time.AfterFunc(5*time.Second, func() {
+					gs.mu.Lock()
+					gs.assemblyState = 1
+
+					// 如果完成的是四级装配，将最大难度设置为3
+					if completedDifficulty == 4 {
+						gs.assemblyMaxDifficulty = 3
+						fmt.Println("✓ 四级装配已完成，最大装配难度已设置为3")
+						logrus.Infof("四级装配已完成，最大装配难度已设置为3")
+					}
+
+					gs.assemblyDifficulty = 0
+					gs.mu.Unlock()
+					fmt.Println("✓ 装配完成,已返回空闲状态")
+				})
+
+				gs.mu.Unlock()
+			} else {
+				gs.mu.Unlock()
+				fmt.Printf("✗ 当前状态不是5 (当前状态=%d)\n", gs.assemblyState)
+			}
+
+		case "airsupportstatus":
+			gs.mu.RLock()
+			stateNames := map[uint32]string{
+				0: "IDLE (未激活)",
+				1: "ACTIVE (进行中)",
+				2: "LOCKED (被对方锁定)",
+			}
+			stateName := stateNames[gs.airSupportStatus]
+			freeTime := gs.airSupportFreeTime
+			costCoins := gs.airSupportCostCoins
+			remainingEconomy := gs.remainingEconomy
+			gs.mu.RUnlock()
+
+			fmt.Println("\n========== 空中支援状态 ==========")
+			fmt.Printf("状态: %s\n", stateName)
+			fmt.Printf("免费时间: %d 秒\n", freeTime)
+			fmt.Printf("已消耗金币: %d\n", costCoins)
+			fmt.Printf("剩余经济: %d (可用于付费空中支援)\n", remainingEconomy)
+			fmt.Println("==================================\n")
+
+		case "airsupportfree":
+			if len(parts) < 2 {
+				fmt.Println("用法: airsupportfree <秒数>")
+				continue
+			}
+			seconds, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Println("✗ 参数错误: 必须为正整数")
+				continue
+			}
+			gs.mu.Lock()
+			gs.airSupportFreeTime = uint32(seconds)
+			gs.mu.Unlock()
+			fmt.Printf("✓ 免费时间已设置为: %d 秒\n", seconds)
+
+		case "airsupportlock":
+			if len(parts) < 2 {
+				fmt.Println("用法: airsupportlock <0/1>")
+				fmt.Println("  0: 解除锁定")
+				fmt.Println("  1: 锁定")
+				continue
+			}
+			lock, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil || lock > 1 {
+				fmt.Println("✗ 参数错误: 必须为0或1")
+				continue
+			}
+			gs.mu.Lock()
+			if lock == 1 {
+				gs.airSupportStatus = 2
+				fmt.Println("✓ 空中支援已锁定")
+			} else {
+				if gs.airSupportStatus == 2 {
+					gs.airSupportStatus = 0
+				}
+				fmt.Println("✓ 空中支援已解除锁定")
+			}
+			gs.mu.Unlock()
+
+		case "airsupportstart":
+			if len(parts) < 2 {
+				fmt.Println("用法: airsupportstart <1/2>")
+				fmt.Println("  1: 免费模式")
+				fmt.Println("  2: 付费模式")
+				continue
+			}
+			cmdId, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil || (cmdId != 1 && cmdId != 2) {
+				fmt.Println("✗ 参数错误: 必须为1或2")
+				continue
+			}
+			success := gs.handleAirSupportCommand(uint32(cmdId))
+			if success {
+				fmt.Printf("✓ 空中支援已启动 (模式=%d)\n", cmdId)
+			} else {
+				fmt.Println("✗ 空中支援启动失败")
+			}
+
+		case "airsupportstop":
+			gs.mu.Lock()
+			if gs.airSupportStatus == 1 {
+				elapsed := time.Since(gs.airSupportActivatedAt).Seconds()
+				success := gs.deductAirSupportTime(uint32(elapsed))
+				if !success {
+					logrus.Warnf("空中支援中断时金币不足, 但仍然强制中断")
+					fmt.Println("⚠ 警告: 金币不足,但空中支援已强制中断")
+				}
+				gs.airSupportStatus = 0
+				gs.airSupportIsFreeOnly = false
+				gs.mu.Unlock()
+				fmt.Printf("✓ 空中支援已中断, 消耗时间: %.0f秒\n", elapsed)
+			} else {
+				gs.mu.Unlock()
+				fmt.Println("✗ 当前没有空中支援在进行中")
+			}
+
+		case "bastionstart":
+			if len(parts) < 2 {
+				fmt.Println("用法: bastionstart <0/1> (0=红方, 1=蓝方)")
+				continue
+			}
+			side, err := strconv.Atoi(parts[1])
+			if err != nil || (side != 0 && side != 1) {
+				fmt.Println("✗ 无效的参数, 必须是 0(红方) 或 1(蓝方)")
+				continue
+			}
+			gs.startBastionTimer(side)
+			sideName := "红方"
+			if side == 1 {
+				sideName = "蓝方"
+			}
+			fmt.Printf("✓ %s堡垒占领计时已开始\n", sideName)
+
+		case "bastionstop":
+			if len(parts) < 2 {
+				fmt.Println("用法: bastionstop <0/1> (0=红方, 1=蓝方)")
+				continue
+			}
+			side, err := strconv.Atoi(parts[1])
+			if err != nil || (side != 0 && side != 1) {
+				fmt.Println("✗ 无效的参数, 必须是 0(红方) 或 1(蓝方)")
+				continue
+			}
+			gs.stopBastionTimer(side)
+			sideName := "红方"
+			if side == 1 {
+				sideName = "蓝方"
+			}
+			fmt.Printf("✓ %s堡垒占领计时已停止\n", sideName)
+
+		case "bastionstatus":
+			gs.mu.RLock()
+			fmt.Println("\n===== 堡垒占领计时状态 =====")
+			fmt.Printf("机制ID列表: %v\n", gs.bastionMechanismIds)
+			fmt.Printf("计时列表(秒): %v\n", gs.bastionMechanismTimes)
+			fmt.Printf("红方计时器激活: %v\n", gs.bastionTimerActive[0])
+			fmt.Printf("蓝方计时器激活: %v\n", gs.bastionTimerActive[1])
+
+			// 显示详细状态
+			for i, id := range gs.bastionMechanismIds {
+				sideName := "红方"
+				if id == 2 {
+					sideName = "蓝方"
+				}
+				fmt.Printf("%s (ID=%d): %d秒\n", sideName, id, gs.bastionMechanismTimes[i])
+			}
+			gs.mu.RUnlock()
+			fmt.Println("============================")
+
+		// ==================== Rune 能量机关控制台指令 ====================
+		case "runestatus":
+			gs.mu.RLock()
+			fmt.Println("\n===== 能量机关状态 =====")
+			statusNames := map[uint32]string{1: "未激活", 2: "正在激活", 3: "已激活(增益中)"}
+			runeType := "小能量机关"
+			if !gs.runeIsSmallRune {
+				runeType = "大能量机关"
+			}
+			fmt.Printf("能量机关类型: %s\n", runeType)
+			fmt.Printf("当前状态: %s (%d)\n", statusNames[gs.runeStatus], gs.runeStatus)
+			fmt.Printf("可激活次数: %d\n", gs.runeAvailableActivations)
+			fmt.Printf("已激活灯臂数: %d\n", gs.runeActivatedArms)
+			fmt.Printf("总环数: %d\n", gs.runeTotalRings)
+			fmt.Printf("平均环数: %d\n", gs.runeAverageRings)
+			fmt.Printf("失败概率: %.2f%%\n", gs.runeFailProbability*100)
+			if gs.runeBuffActive {
+				leftTime := uint32(0)
+				if gs.runeBuffEndTime.After(time.Now()) {
+					leftTime = uint32(gs.runeBuffEndTime.Sub(time.Now()).Seconds())
+				}
+				fmt.Printf("Buff状态: 激活中 (剩余%d秒)\n", leftTime)
+				fmt.Printf("  攻击增益: %d%%\n", gs.runeBuffAttackBoost)
+				fmt.Printf("  防御增益: %d%%\n", gs.runeBuffDefenseBoost)
+				fmt.Printf("  热量冷却: %d倍\n", gs.runeBuffHeatCooldownBoost)
+			} else {
+				fmt.Println("Buff状态: 未激活")
+			}
+			gs.mu.RUnlock()
+			fmt.Println("========================")
+
+		case "runeactivate":
+			// 手动触发能量机关激活
+			if gs.handleRuneActivateCommand(1) {
+				fmt.Println("✓ 能量机关激活已开始")
+			} else {
+				fmt.Println("✗ 能量机关激活失败 (检查可激活次数和当前状态)")
+			}
+
+		case "runeactivations":
+			// 设置可激活次数
+			if len(parts) < 2 {
+				fmt.Println("用法: runeactivations <次数>")
+				continue
+			}
+			count, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的次数: %s\n", parts[1])
+				continue
+			}
+			gs.setRuneAvailableActivations(uint32(count))
+			fmt.Printf("✓ 能量机关可激活次数已设置为: %d\n", count)
+
+		case "runefailprob":
+			// 设置失败概率
+			if len(parts) < 2 {
+				fmt.Println("用法: runefailprob <概率> (0.0-1.0)")
+				continue
+			}
+			prob, err := strconv.ParseFloat(parts[1], 32)
+			if err != nil || prob < 0 || prob > 1 {
+				fmt.Printf("无效的概率: %s (应为0.0-1.0)\n", parts[1])
+				continue
+			}
+			gs.setRuneFailProbability(float32(prob))
+			fmt.Printf("✓ 能量机关失败概率已设置为: %.2f%%\n", prob*100)
+
+		case "runesetstatus":
+			// 手动设置能量机关状态
+			if len(parts) < 2 {
+				fmt.Println("用法: runesetstatus <状态> (1=未激活, 2=正在激活, 3=已激活)")
+				continue
+			}
+			status, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil || status < 1 || status > 3 {
+				fmt.Printf("无效的状态: %s (应为1-3)\n", parts[1])
+				continue
+			}
+			gs.setRuneStatus(uint32(status))
+			fmt.Printf("✓ 能量机关状态已设置为: %d\n", status)
+
+		case "runesetarms":
+			// 手动设置已激活灯臂数
+			if len(parts) < 2 {
+				fmt.Println("用法: runesetarms <灯臂数> (0-5)")
+				continue
+			}
+			arms, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil || arms > 5 {
+				fmt.Printf("无效的灯臂数: %s (应为0-5)\n", parts[1])
+				continue
+			}
+			gs.setRuneActivatedArms(uint32(arms))
+			fmt.Printf("✓ 能量机关已激活灯臂数已设置为: %d\n", arms)
+
+		case "runesetrings":
+			// 手动设置平均环数
+			if len(parts) < 2 {
+				fmt.Println("用法: runesetrings <平均环数> (1-10)")
+				continue
+			}
+			rings, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil || rings > 10 {
+				fmt.Printf("无效的平均环数: %s\n", parts[1])
+				continue
+			}
+			gs.setRuneAverageRings(uint32(rings))
+			fmt.Printf("✓ 能量机关平均环数已设置为: %d\n", rings)
+
+		case "runeset":
+			// 同时设置已激活灯臂数和平均环数
+			if len(parts) < 3 {
+				fmt.Println("用法: runeset <灯臂数> <平均环数>")
+				fmt.Println("  灯臂数: 0-5")
+				fmt.Println("  平均环数: 1-10")
+				fmt.Println("示例: runeset 3 7")
+				continue
+			}
+			arms, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil || arms > 5 {
+				fmt.Printf("无效的灯臂数: %s (应为0-5)\n", parts[1])
+				continue
+			}
+			rings, err := strconv.ParseUint(parts[2], 10, 32)
+			if err != nil || rings > 10 {
+				fmt.Printf("无效的平均环数: %s (应为1-10)\n", parts[2])
+				continue
+			}
+			gs.mu.Lock()
+			gs.runeActivatedArms = uint32(arms)
+			gs.runeAverageRings = uint32(rings)
+			if arms > 0 {
+				gs.runeTotalRings = uint32(rings) * uint32(arms)
+			} else {
+				gs.runeTotalRings = 0
+			}
+			// 发送状态同步
+			gs.publishRuneStatusSyncUnsafe()
+			gs.mu.Unlock()
+			logrus.Infof("能量机关已设置: 灯臂数=%d, 平均环数=%d", arms, rings)
+			fmt.Printf("✓ 能量机关已设置: 灯臂数=%d, 平均环数=%d\n", arms, rings)
+
+		case "runereset":
+			// 重置能量机关状态
+			gs.resetRuneState()
+			fmt.Println("✓ 能量机关状态已重置")
+
+		case "runesync":
+			// 手动发送RuneStatusSync
+			gs.mu.Lock()
+			gs.publishRuneStatusSyncUnsafe()
+			gs.mu.Unlock()
+			fmt.Println("✓ 已发送 RuneStatusSync")
+
+		case "stop":
+			gs.stopSimulator()
+			return
+
+		default:
+			fmt.Printf("未知命令: %s (输入 'help' 查看帮助)\n", cmd)
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		logrus.Errorf("读取输入错误: %v", err)
+	}
+}
+
+func Publish(simulator *GameSimulator) {
+	epoch := 0
+	ticker := time.NewTicker(1000 / 150 * time.Millisecond) // 150Hz
+	defer ticker.Stop()
+
+	logrus.Info("比赛模拟器启动 - 3局2胜制")
+	logrus.Info("输入 'help' 查看控制台命令")
+
+	// 启动控制台命令监听器
+	go simulator.handleConsoleCommands()
+
+	for range ticker.C {
+		// 检查是否应该停止
+		if simulator.shouldStopSimulator() {
+			logrus.Info("模拟器已停止")
+			break
+		}
+
 		epoch++
-		time.Sleep(1000 / 150 * time.Millisecond)
-		if epoch%30 == 0 { //5HZ
-			out, err := proto.Marshal(&rmcp.GameStatus{
-				CurrentRound:      1,
-				TotalRounds:       1,
-				RedScore:          0,
-				BlueScore:         0,
-				CurrentStage:      0,
-				StageCountdownSec: 0,
-				StageElapsedSec:   int32(time.Now().Unix() - initTime),
-				IsPaused:          false,
-			})
+
+		// 更新比赛阶段
+		if !simulator.isPausedSafe() && epoch%150 == 0 { // 每秒检查一次
+			simulator.updateStage()
+		}
+
+		// 模拟随机暂停（低概率）- 可以通过控制台命令禁用
+		if epoch%1500 == 0 && simulator.rand.Float32() < 0.05 { // 每10秒有5%概率
+			// simulator.togglePause() // 取消注释以启用随机暂停
+		}
+
+		// 5Hz 发布游戏状态
+		if epoch%30 == 0 {
+			status := simulator.getGameStatus()
+			out, err := proto.Marshal(status)
 			if err != nil {
 				logrus.Warnf("pb序列化失败: %v", err)
+				continue
 			}
 			err = server.Publish("GameStatus", out, false, 0)
+			if err != nil {
+				logrus.Warnf("MQTT发布失败: %v", err)
+			}
+		}
+
+		// 10Hz 发布全局单位状态
+		if epoch%15 == 0 {
+			unitStatus := simulator.getGlobalUnitStatus()
+			out, err := proto.Marshal(unitStatus)
+			if err != nil {
+				logrus.Warnf("GlobalUnitStatus pb序列化失败: %v", err)
+				continue
+			}
+			err = server.Publish("GlobalUnitStatus", out, false, 0)
+			if err != nil {
+				logrus.Warnf("GlobalUnitStatus MQTT发布失败: %v", err)
+			}
+		}
+
+		// 10Hz 发布全局物流状态
+		if epoch%15 == 0 {
+			logisticsStatus := simulator.getGlobalLogisticsStatus()
+			out, err := proto.Marshal(logisticsStatus)
+			if err != nil {
+				logrus.Warnf("GlobalLogisticsStatus pb序列化失败: %v", err)
+				continue
+			}
+			err = server.Publish("GlobalLogisticsStatus", out, false, 0)
+			if err != nil {
+				logrus.Warnf("GlobalLogisticsStatus MQTT发布失败: %v", err)
+			}
+		}
+
+		// 10Hz 发布机器人模块状态
+		if epoch%15 == 0 {
+			moduleStatus := simulator.getRobotModuleStatus()
+			out, err := proto.Marshal(moduleStatus)
+			if err != nil {
+				logrus.Warnf("RobotModuleStatus pb序列化失败: %v", err)
+				continue
+			}
+			err = server.Publish("RobotModuleStatus", out, false, 0)
+			if err != nil {
+				logrus.Warnf("RobotModuleStatus MQTT发布失败: %v", err)
+			}
+		}
+
+		// 10Hz 发布机器人复活状态
+		if epoch%15 == 0 {
+			respawnStatus := simulator.getRobotRespawnStatus()
+			out, err := proto.Marshal(respawnStatus)
+			if err != nil {
+				logrus.Warnf("RobotRespawnStatus pb序列化失败: %v", err)
+				continue
+			}
+			err = server.Publish("RobotRespawnStatus", out, false, 0)
+			if err != nil {
+				logrus.Warnf("RobotRespawnStatus MQTT发布失败: %v", err)
+			}
+		}
+
+		// 10Hz 发布机器人伤害统计
+		if epoch%15 == 0 {
+			injuryStat := simulator.getRobotInjuryStat()
+			out, err := proto.Marshal(injuryStat)
+			if err != nil {
+				logrus.Warnf("RobotInjuryStat pb序列化失败: %v", err)
+				continue
+			}
+			err = server.Publish("RobotInjuryStat", out, false, 1)
+			if err != nil {
+				logrus.Warnf("RobotInjuryStat MQTT发布失败: %v", err)
+			}
+		}
+
+		// 10Hz 发布机器人静态状态
+		if epoch%15 == 0 {
+			staticStatus := simulator.getRobotStaticStatus()
+			out, err := proto.Marshal(staticStatus)
+			if err != nil {
+				logrus.Warnf("RobotStaticStatus pb序列化失败: %v", err)
+				continue
+			}
+			err = server.Publish("RobotStaticStatus", out, false, 0)
+			if err != nil {
+				logrus.Warnf("RobotStaticStatus MQTT发布失败: %v", err)
+			}
+		}
+
+		// 10Hz 发布机器人动态状态
+		if epoch%15 == 0 {
+			dynamicStatus := simulator.getRobotDynamicStatus()
+			out, err := proto.Marshal(dynamicStatus)
+			if err != nil {
+				logrus.Warnf("RobotDynamicStatus pb序列化失败: %v", err)
+				continue
+			}
+			err = server.Publish("RobotDynamicStatus", out, false, 0)
+			if err != nil {
+				logrus.Warnf("RobotDynamicStatus MQTT发布失败: %v", err)
+			}
+		}
+
+		// 10Hz 发布机器人位置
+		if epoch%15 == 0 {
+			position := simulator.getRobotPosition()
+			out, err := proto.Marshal(position)
+			if err != nil {
+				logrus.Warnf("RobotPosition pb序列化失败: %v", err)
+				continue
+			}
+			err = server.Publish("RobotPosition", out, false, 0)
+			if err != nil {
+				logrus.Warnf("RobotPosition MQTT发布失败: %v", err)
+			}
+		}
+
+		// 10Hz 发布判罚信息
+		if epoch%15 == 0 {
+			penaltyInfo := simulator.getPenaltyInfo()
+			out, err := proto.Marshal(penaltyInfo)
+			if err != nil {
+				logrus.Warnf("PenaltyInfo pb序列化失败: %v", err)
+				continue
+			}
+			err = server.Publish("PenaltyInfo", out, false, 0)
+			if err != nil {
+				logrus.Warnf("PenaltyInfo MQTT发布失败: %v", err)
+			}
+		}
+
+		// 10Hz 发布机器人路径规划信息
+		if epoch%15 == 0 {
+			pathPlanInfo := simulator.getRobotPathPlanInfo()
+			out, err := proto.Marshal(pathPlanInfo)
+			if err != nil {
+				logrus.Warnf("RobotPathPlanInfo pb序列化失败: %v", err)
+				continue
+			}
+			err = server.Publish("RobotPathPlanInfo", out, false, 0)
+			if err != nil {
+				logrus.Warnf("RobotPathPlanInfo MQTT发布失败: %v", err)
+			}
+		}
+
+		// 10Hz 发布雷达信息
+		if epoch%15 == 0 {
+			raderInfo := simulator.getRaderInfoToClient()
+			out, err := proto.Marshal(raderInfo)
+			if err != nil {
+				logrus.Warnf("RaderInfoToClient pb序列化失败: %v", err)
+				continue
+			}
+			err = server.Publish("RaderInfoToClient", out, false, 0)
+			if err != nil {
+				logrus.Warnf("RaderInfoToClient MQTT发布失败: %v", err)
+			}
+		}
+
+		// 10Hz 发布部署模式状态
+		if epoch%15 == 0 {
+			deployModeStatus := simulator.getDeployModeStatus()
+			out, err := proto.Marshal(deployModeStatus)
+			if err != nil {
+				logrus.Warnf("DeployModeStatusSync pb序列化失败: %v", err)
+				continue
+			}
+			err = server.Publish("DeployModeStatusSync", out, false, 0)
+			if err != nil {
+				logrus.Warnf("DeployModeStatusSync MQTT发布失败: %v", err)
+			}
+		}
+
+		// 10Hz 发布飞镖系统状态
+		if epoch%15 == 0 {
+			dartStatus := simulator.getDartStatus()
+			out, err := proto.Marshal(dartStatus)
+			if err != nil {
+				logrus.Warnf("DartSelectTargetStatusSync pb序列化失败: %v", err)
+				continue
+			}
+			err = server.Publish("DartSelectTargetStatusSync", out, false, 0)
+			if err != nil {
+				logrus.Warnf("DartSelectTargetStatusSync MQTT发布失败: %v", err)
+			}
+		}
+
+		// 10Hz 发布装配系统状态
+		if epoch%15 == 0 {
+			assemblyStatus := simulator.getTechCoreMotionStateSync()
+			out, err := proto.Marshal(assemblyStatus)
+			if err != nil {
+				logrus.Warnf("TechCoreMotionStateSync pb序列化失败: %v", err)
+				continue
+			}
+			err = server.Publish("TechCoreMotionStateSync", out, false, 0)
+			if err != nil {
+				logrus.Warnf("TechCoreMotionStateSync MQTT发布失败: %v", err)
+			}
+			// // 添加周期性调试输出（仅在状态非0时输出，避免刷屏）
+			// if assemblyStatus.Status != 0 {
+			// 	simulator.mu.RLock()
+			// 	difficulty := simulator.assemblyDifficulty
+			// 	simulator.mu.RUnlock()
+			// 	logrus.Debugf("[能量单元装配-周期] TechCoreMotionStateSync: Status=%d, MaxDifficulty=%d, 当前难度=%d",
+			// 		assemblyStatus.Status, assemblyStatus.MaximumDifficultyLevel, difficulty)
+			// }
+		}
+
+		// 1Hz 更新空中支援时间 (累积 + 扣除)
+		if epoch%150 == 0 {
+			simulator.updateAirSupportTime()
+		}
+
+		// 10Hz 发布空中支援状态
+		if epoch%15 == 0 {
+			airSupportStatus := simulator.getAirSupportStatusSync()
+			out, err := proto.Marshal(airSupportStatus)
+			if err != nil {
+				logrus.Warnf("AirSupportStatusSync pb序列化失败: %v", err)
+				continue
+			}
+			err = server.Publish("AirSupportStatusSync", out, false, 0)
+			if err != nil {
+				logrus.Warnf("AirSupportStatusSync MQTT发布失败: %v", err)
+			}
+		}
+
+		// 10Hz 发布GlobalSpecialMechanism状态 (堡垒占领计时)
+		if epoch%15 == 0 {
+			specialMechanism := simulator.getGlobalSpecialMechanism()
+			out, err := proto.Marshal(specialMechanism)
+			if err != nil {
+				logrus.Warnf("GlobalSpecialMechanism pb序列化失败: %v", err)
+				continue
+			}
+			err = server.Publish("GlobalSpecialMechanism", out, false, 0)
+			if err != nil {
+				logrus.Warnf("GlobalSpecialMechanism MQTT发布失败: %v", err)
+			}
+		}
+
+		// 1Hz 更新能量机关激活次数 (根据比赛时间自动授予)
+		if epoch%150 == 0 {
+			simulator.updateRuneActivations()
+		}
+
+		// 10Hz 发布 RuneStatusSync
+		if epoch%15 == 0 {
+			runeStatus := simulator.getRuneStatusSync()
+			out, err := proto.Marshal(runeStatus)
+			if err != nil {
+				logrus.Warnf("RuneStatusSync pb序列化失败: %v", err)
+				continue
+			}
+			err = server.Publish("RuneStatusSync", out, false, 0)
+			if err != nil {
+				logrus.Warnf("RuneStatusSync MQTT发布失败: %v", err)
+			}
+		}
+
+		// 10Hz 发布 Buff (如果有活动的Buff)
+		if epoch%15 == 0 {
+			buff := simulator.getBuff()
+			if buff != nil {
+				out, err := proto.Marshal(buff)
+				if err != nil {
+					logrus.Warnf("Buff pb序列化失败: %v", err)
+					continue
+				}
+				err = server.Publish("Buff", out, false, 0)
+				if err != nil {
+					logrus.Warnf("Buff MQTT发布失败: %v", err)
+				}
+			}
+		}
+
+		// 比赛自然结束时的处理(所有局结束后回到未开始状态)
+		currentStage := simulator.getCurrentStageSafe()
+		if currentStage == StageNotStarted && epoch%150 == 0 {
+			simulator.mu.RLock()
+			redScore := simulator.redScore
+			blueScore := simulator.blueScore
+			currentRound := simulator.currentRound
+			totalRounds := simulator.totalRounds
+			simulator.mu.RUnlock()
+
+			// 只有当完成了所有局才显示结束信息
+			if currentRound > totalRounds || (redScore > 0 || blueScore > 0) {
+				logrus.Infof("比赛自然结束! 最终比分 红:%d 蓝:%d", redScore, blueScore)
+				logrus.Info("输入 'reset' 重新开始比赛,或输入 'stop' 退出模拟器")
+			}
+			// 不自动退出，等待用户命令
 		}
 	}
 }

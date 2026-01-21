@@ -17,14 +17,22 @@ func main() {
 	//}
 	var wg sync.WaitGroup
 
+	// 创建游戏模拟器 (3局2胜制)
+	simulator := referee.NewGameSimulator(3)
+
 	streamSource := 0
 	wg.Add(1)
 	// cha := make(chan gocv.Mat)
 	cls := &atomic.Bool{}
-	go stream.StartEncodedStream(streamSource, &wg, cls)
+	// 传递 simulator 给视频流,以便检查是否应该发送视频
+	go stream.StartEncodedStream(streamSource, &wg, cls, simulator)
 
-	go referee.StartMqttServer(&wg)
-	go referee.Publish()
+	// 启动 MQTT 服务器并传入 simulator
+	go referee.StartMqttServer(&wg, simulator)
+
+	// 启动发布循环并传入 simulator (包含控制台命令处理)
+	go referee.Publish(simulator)
+
 	// window := gocv.NewWindow("Encoded Camera Feed")
 	// for !cls.Load() {
 	// 	select {

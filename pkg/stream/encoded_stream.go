@@ -8,8 +8,13 @@ import (
 	"gocv.io/x/gocv"
 )
 
+// VideoStreamCondition 视频流条件检查接口
+type VideoStreamCondition interface {
+	ShouldSendVideoStream() bool
+}
+
 // StartEncodedStream 启动带HEVC编码的视频流
-func StartEncodedStream[T interface{ int | string }](source T, wg *sync.WaitGroup,  cls *atomic.Bool) {
+func StartEncodedStream[T interface{ int | string }](source T, wg *sync.WaitGroup, cls *atomic.Bool, condition VideoStreamCondition) {
 	defer wg.Done()
 
 	conn := GetUDPConn()
@@ -61,10 +66,16 @@ func StartEncodedStream[T interface{ int | string }](source T, wg *sync.WaitGrou
 			continue
 		}
 
+		// 检查是否应该发送视频流
+		if condition != nil && !condition.ShouldSendVideoStream() {
+			// 不发送视频流,跳过编码和发送步骤
+			continue
+		}
+
 		// 编码帧
 		encodedData, err := encoder.EncodeFrame(frame)
 		if err != nil {
-			logrus.Fatalf("编码失败: %v", err)
+			logrus.Errorf("编码失败: %v", err)
 			continue
 		}
 
@@ -91,7 +102,7 @@ func StartEncodedStream[T interface{ int | string }](source T, wg *sync.WaitGrou
 	flushedData, _ := encoder.Flush()
 	if len(flushedData) > 0 {
 		conn.Write(flushedData)
-		logrus.Debug("发送刷新数据: %d 字节", len(flushedData))
+		logrus.Debugf("发送刷新数据: %d 字节", len(flushedData))
 	}
 	logrus.Debug("编码流传输完成")
 	// close(cha)

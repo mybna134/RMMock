@@ -1,0 +1,1079 @@
+package referee
+
+import (
+	"bufio"
+	"fmt"
+	"math/rand"
+	"os"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/sirupsen/logrus"
+	"github.com/stydxm/RMMock/pkg/rmcp"
+	"google.golang.org/protobuf/proto"
+)
+
+// 比赛阶段定义
+const (
+	StagePreMatch    = 0 // 赛前准备阶段
+	StageSetup       = 1 // 备赛阶段 (5分钟)
+	StageBattle      = 2 // 对战阶段 (7分钟)
+	StageCalculating = 3 // 结算阶段
+	StageFinished    = 4 // 比赛结束
+)
+
+// 各阶段持续时间（秒）
+var stageDurations = map[uint32]int32{
+	StagePreMatch:    15,  // 15秒准备
+	StageSetup:       300, // 5分钟备赛
+	StageBattle:      420, // 7分钟对战
+	StageCalculating: 10,  // 10秒结算
+}
+
+// GameSimulator 比赛状态模拟器
+type GameSimulator struct {
+	mu                sync.RWMutex
+	currentRound      uint32
+	totalRounds       uint32
+	redScore          uint32
+	blueScore         uint32
+	currentStage      uint32
+	stageStartTime    time.Time
+	isPaused          bool
+	pauseStartTime    time.Time
+	totalPausedTime   int32
+	rand              *rand.Rand
+	shouldStop        bool
+
+	// GlobalUnitStatus 相关字段
+	baseHealth        uint32
+	baseStatus        uint32
+	baseShield        uint32
+	outpostHealth     uint32
+	outpostStatus     uint32
+	robotHealth       []uint32
+	robotBullets      []int32
+	totalDamageRed    uint32
+	totalDamageBlue   uint32
+
+	// GlobalLogisticsStatus 相关字段
+	remainingEconomy      uint32
+	totalEconomyObtained  uint64
+	techLevel             uint32
+	encryptionLevel       uint32
+
+	// RobotModuleStatus 相关字段
+	powerManager       uint32
+	rfid               uint32
+	lightStrip         uint32
+	smallShooter       uint32
+	bigShooter         uint32
+	uwb                uint32
+	armor              uint32
+	videoTransmission  uint32
+	capacitor          uint32
+	mainController     uint32
+}
+
+// NewGameSimulator 创建新的比赛模拟器
+func NewGameSimulator(totalRounds uint32) *GameSimulator {
+	// 初始化机器人血量和子弹数（假设有14个机器人）
+	robotHealth := make([]uint32, 14)
+	robotBullets := make([]int32, 14)
+	for i := 0; i < 14; i++ {
+		robotHealth[i] = 600   // 初始血量
+		robotBullets[i] = 350  // 初始子弹数
+	}
+
+	return &GameSimulator{
+		currentRound:    1,
+		totalRounds:     totalRounds,
+		currentStage:    StagePreMatch,
+		stageStartTime:  time.Now(),
+		rand:            rand.New(rand.NewSource(time.Now().UnixNano())),
+
+		// 初始化 GlobalUnitStatus 字段
+		baseHealth:      5000,
+		baseStatus:      1,
+		baseShield:      1500,
+		outpostHealth:   1500,
+		outpostStatus:   1,
+		robotHealth:     robotHealth,
+		robotBullets:    robotBullets,
+		totalDamageRed:  0,
+		totalDamageBlue: 0,
+
+		// 初始化 GlobalLogisticsStatus 字段
+		remainingEconomy:     500,
+		totalEconomyObtained: 0,
+		techLevel:            1,
+		encryptionLevel:      0,
+
+		// 初始化 RobotModuleStatus 字段 (所有模块默认正常状态 = 1)
+		powerManager:      1,
+		rfid:              1,
+		lightStrip:        1,
+		smallShooter:      1,
+		bigShooter:        1,
+		uwb:               1,
+		armor:             1,
+		videoTransmission: 1,
+		capacitor:         1,
+		mainController:    1,
+	}
+}
+
+// updateStage 更新比赛阶段
+func (gs *GameSimulator) updateStage() {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+
+	elapsed := gs.getStageElapsedTimeUnsafe()
+	duration, exists := stageDurations[gs.currentStage]
+
+	if !exists || elapsed >= duration {
+		switch gs.currentStage {
+		case StagePreMatch:
+			gs.currentStage = StageSetup
+		case StageSetup:
+			gs.currentStage = StageBattle
+		case StageBattle:
+			gs.currentStage = StageCalculating
+			gs.calculateRoundResultUnsafe()
+		case StageCalculating:
+			if gs.currentRound < gs.totalRounds {
+				gs.currentRound++
+				gs.currentStage = StagePreMatch
+			} else {
+				gs.currentStage = StageFinished
+			}
+		case StageFinished:
+			return
+		}
+		gs.stageStartTime = time.Now()
+		gs.totalPausedTime = 0
+		logrus.Infof("阶段切换: Stage %d, Round %d/%d", gs.currentStage, gs.currentRound, gs.totalRounds)
+	}
+}
+
+// calculateRoundResult 计算本局结果（加锁版本）
+func (gs *GameSimulator) calculateRoundResult() {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.calculateRoundResultUnsafe()
+}
+
+// calculateRoundResultUnsafe 计算本局结果（不加锁）
+func (gs *GameSimulator) calculateRoundResultUnsafe() {
+	winner := gs.rand.Intn(3)
+	switch winner {
+	case 0: // 红方获胜
+		gs.redScore++
+		logrus.Infof("第 %d 局结束 - 红方获胜! 当前比分 红:%d 蓝:%d", gs.currentRound, gs.redScore, gs.blueScore)
+	case 1: // 蓝方获胜
+		gs.blueScore++
+		logrus.Infof("第 %d 局结束 - 蓝方获胜! 当前比分 红:%d 蓝:%d", gs.currentRound, gs.redScore, gs.blueScore)
+	case 2: // 平局
+		logrus.Infof("第 %d 局结束 - 平局! 当前比分 红:%d 蓝:%d", gs.currentRound, gs.redScore, gs.blueScore)
+	}
+}
+
+// getStageElapsedTime 获取当前阶段已过时间（加锁版本）
+func (gs *GameSimulator) getStageElapsedTime() int32 {
+	gs.mu.RLock()
+	defer gs.mu.RUnlock()
+	return gs.getStageElapsedTimeUnsafe()
+}
+
+// getStageElapsedTimeUnsafe 获取当前阶段已过时间（不加锁）
+func (gs *GameSimulator) getStageElapsedTimeUnsafe() int32 {
+	if gs.isPaused {
+		return int32(gs.pauseStartTime.Sub(gs.stageStartTime).Seconds()) - gs.totalPausedTime
+	}
+	return int32(time.Since(gs.stageStartTime).Seconds()) - gs.totalPausedTime
+}
+
+// getStageCountdown 获取当前阶段倒计时
+func (gs *GameSimulator) getStageCountdown() int32 {
+	gs.mu.RLock()
+	defer gs.mu.RUnlock()
+	return gs.getStageCountdownUnsafe()
+}
+
+// getStageCountdownUnsafe 获取当前阶段倒计时（不加锁）
+func (gs *GameSimulator) getStageCountdownUnsafe() int32 {
+	duration, exists := stageDurations[gs.currentStage]
+	if !exists {
+		return 0
+	}
+	remaining := duration - gs.getStageElapsedTimeUnsafe()
+	if remaining < 0 {
+		return 0
+	}
+	return remaining
+}
+
+// togglePause 切换暂停状态
+func (gs *GameSimulator) togglePause() {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+
+	if gs.isPaused {
+		pauseDuration := int32(time.Since(gs.pauseStartTime).Seconds())
+		gs.totalPausedTime += pauseDuration
+		gs.isPaused = false
+		logrus.Info("比赛继续")
+	} else {
+		gs.pauseStartTime = time.Now()
+		gs.isPaused = true
+		logrus.Info("比赛暂停")
+	}
+}
+
+// getGameStatus 获取当前游戏状态
+func (gs *GameSimulator) getGameStatus() *rmcp.GameStatus {
+	gs.mu.RLock()
+	defer gs.mu.RUnlock()
+
+	return &rmcp.GameStatus{
+		CurrentRound:      gs.currentRound,
+		TotalRounds:       gs.totalRounds,
+		RedScore:          gs.redScore,
+		BlueScore:         gs.blueScore,
+		CurrentStage:      gs.currentStage,
+		StageCountdownSec: gs.getStageCountdownUnsafe(),
+		StageElapsedSec:   gs.getStageElapsedTimeUnsafe(),
+		IsPaused:          gs.isPaused,
+	}
+}
+
+// getGlobalUnitStatus 获取全局单位状态
+func (gs *GameSimulator) getGlobalUnitStatus() *rmcp.GlobalUnitStatus {
+	gs.mu.RLock()
+	defer gs.mu.RUnlock()
+
+	return &rmcp.GlobalUnitStatus{
+		BaseHealth:      gs.baseHealth,
+		BaseStatus:      gs.baseStatus,
+		BaseShield:      gs.baseShield,
+		OutpostHealth:   gs.outpostHealth,
+		OutpostStatus:   gs.outpostStatus,
+		RobotHealth:     gs.robotHealth,
+		RobotBullets:    gs.robotBullets,
+		TotalDamageRed:  gs.totalDamageRed,
+		TotalDamageBlue: gs.totalDamageBlue,
+	}
+}
+
+// getGlobalLogisticsStatus 获取全局物流状态
+func (gs *GameSimulator) getGlobalLogisticsStatus() *rmcp.GlobalLogisticsStatus {
+	gs.mu.RLock()
+	defer gs.mu.RUnlock()
+
+	return &rmcp.GlobalLogisticsStatus{
+		RemainingEconomy:     gs.remainingEconomy,
+		TotalEconomyObtained: gs.totalEconomyObtained,
+		TechLevel:            gs.techLevel,
+		EncryptionLevel:      gs.encryptionLevel,
+	}
+}
+
+// getRobotModuleStatus 获取机器人模块状态
+func (gs *GameSimulator) getRobotModuleStatus() *rmcp.RobotModuleStatus {
+	gs.mu.RLock()
+	defer gs.mu.RUnlock()
+
+	return &rmcp.RobotModuleStatus{
+		PowerManager:      gs.powerManager,
+		Rfid:              gs.rfid,
+		LightStrip:        gs.lightStrip,
+		SmallShooter:      gs.smallShooter,
+		BigShooter:        gs.bigShooter,
+		Uwb:               gs.uwb,
+		Armor:             gs.armor,
+		VideoTransmission: gs.videoTransmission,
+		Capacitor:         gs.capacitor,
+		MainController:    gs.mainController,
+	}
+}
+
+// setRedScore 设置红方得分
+func (gs *GameSimulator) setRedScore(score uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.redScore = score
+	logrus.Infof("红方得分已设置为: %d", score)
+}
+
+// setBlueScore 设置蓝方得分
+func (gs *GameSimulator) setBlueScore(score uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.blueScore = score
+	logrus.Infof("蓝方得分已设置为: %d", score)
+}
+
+// setCurrentRound 设置当前局号
+func (gs *GameSimulator) setCurrentRound(round uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	if round < 1 || round > gs.totalRounds {
+		logrus.Warnf("无效的局号: %d (有效范围: 1-%d)", round, gs.totalRounds)
+		return
+	}
+	gs.currentRound = round
+	logrus.Infof("当前局号已设置为: %d", round)
+}
+
+// setTotalRounds 设置总局数
+func (gs *GameSimulator) setTotalRounds(rounds uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	if rounds < 1 {
+		logrus.Warn("总局数必须大于0")
+		return
+	}
+	gs.totalRounds = rounds
+	logrus.Infof("总局数已设置为: %d", rounds)
+}
+
+// setStage 设置比赛阶段
+func (gs *GameSimulator) setStage(stage uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	if stage > StageFinished {
+		logrus.Warnf("无效的阶段: %d (有效范围: 0-4)", stage)
+		return
+	}
+	gs.currentStage = stage
+	gs.stageStartTime = time.Now()
+	gs.totalPausedTime = 0
+	logrus.Infof("当前阶段已设置为: %d", stage)
+}
+
+// resetMatch 重置比赛
+func (gs *GameSimulator) resetMatch() {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.currentRound = 1
+	gs.redScore = 0
+	gs.blueScore = 0
+	gs.currentStage = StagePreMatch
+	gs.stageStartTime = time.Now()
+	gs.isPaused = false
+	gs.totalPausedTime = 0
+
+	// 重置单位状态
+	gs.baseHealth = 5000
+	gs.baseStatus = 1
+	gs.baseShield = 1500
+	gs.outpostHealth = 1500
+	gs.outpostStatus = 1
+	for i := 0; i < len(gs.robotHealth); i++ {
+		gs.robotHealth[i] = 600
+		gs.robotBullets[i] = 350
+	}
+	gs.totalDamageRed = 0
+	gs.totalDamageBlue = 0
+
+	// 重置物流状态
+	gs.remainingEconomy = 500
+	gs.totalEconomyObtained = 0
+	gs.techLevel = 1
+	gs.encryptionLevel = 0
+
+	logrus.Info("比赛已重置")
+}
+
+// setBaseHealth 设置基地血量
+func (gs *GameSimulator) setBaseHealth(health uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.baseHealth = health
+	logrus.Infof("基地血量已设置为: %d", health)
+}
+
+// setBaseStatus 设置基地状态
+func (gs *GameSimulator) setBaseStatus(status uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.baseStatus = status
+	logrus.Infof("基地状态已设置为: %d", status)
+}
+
+// setBaseShield 设置基地护盾
+func (gs *GameSimulator) setBaseShield(shield uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.baseShield = shield
+	logrus.Infof("基地护盾已设置为: %d", shield)
+}
+
+// setOutpostHealth 设置前哨站血量
+func (gs *GameSimulator) setOutpostHealth(health uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.outpostHealth = health
+	logrus.Infof("前哨站血量已设置为: %d", health)
+}
+
+// setOutpostStatus 设置前哨站状态
+func (gs *GameSimulator) setOutpostStatus(status uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.outpostStatus = status
+	logrus.Infof("前哨站状态已设置为: %d", status)
+}
+
+// setRobotHealth 设置机器人血量
+func (gs *GameSimulator) setRobotHealth(robotID int, health uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	if robotID < 0 || robotID >= len(gs.robotHealth) {
+		logrus.Warnf("无效的机器人ID: %d (有效范围: 0-%d)", robotID, len(gs.robotHealth)-1)
+		return
+	}
+	gs.robotHealth[robotID] = health
+	logrus.Infof("机器人 %d 血量已设置为: %d", robotID, health)
+}
+
+// setRobotBullets 设置机器人子弹数
+func (gs *GameSimulator) setRobotBullets(robotID int, bullets int32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	if robotID < 0 || robotID >= len(gs.robotBullets) {
+		logrus.Warnf("无效的机器人ID: %d (有效范围: 0-%d)", robotID, len(gs.robotBullets)-1)
+		return
+	}
+	gs.robotBullets[robotID] = bullets
+	logrus.Infof("机器人 %d 子弹数已设置为: %d", robotID, bullets)
+}
+
+// setTotalDamageRed 设置红方总伤害
+func (gs *GameSimulator) setTotalDamageRed(damage uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.totalDamageRed = damage
+	logrus.Infof("红方总伤害已设置为: %d", damage)
+}
+
+// setTotalDamageBlue 设置蓝方总伤害
+func (gs *GameSimulator) setTotalDamageBlue(damage uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.totalDamageBlue = damage
+	logrus.Infof("蓝方总伤害已设置为: %d", damage)
+}
+
+// setRemainingEconomy 设置剩余经济
+func (gs *GameSimulator) setRemainingEconomy(economy uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.remainingEconomy = economy
+	logrus.Infof("剩余经济已设置为: %d", economy)
+}
+
+// setTotalEconomyObtained 设置总获得经济
+func (gs *GameSimulator) setTotalEconomyObtained(economy uint64) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.totalEconomyObtained = economy
+	logrus.Infof("总获得经济已设置为: %d", economy)
+}
+
+// setTechLevel 设置科技等级
+func (gs *GameSimulator) setTechLevel(level uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.techLevel = level
+	logrus.Infof("科技等级已设置为: %d", level)
+}
+
+// setEncryptionLevel 设置加密等级
+func (gs *GameSimulator) setEncryptionLevel(level uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.encryptionLevel = level
+	logrus.Infof("加密等级已设置为: %d", level)
+}
+
+// setPowerManager 设置电源管理模块状态
+func (gs *GameSimulator) setPowerManager(status uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.powerManager = status
+	logrus.Infof("电源管理模块状态已设置为: %d", status)
+}
+
+// setRfid 设置RFID模块状态
+func (gs *GameSimulator) setRfid(status uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.rfid = status
+	logrus.Infof("RFID模块状态已设置为: %d", status)
+}
+
+// setLightStrip 设置灯条模块状态
+func (gs *GameSimulator) setLightStrip(status uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.lightStrip = status
+	logrus.Infof("灯条模块状态已设置为: %d", status)
+}
+
+// setSmallShooter 设置小弹丸发射器模块状态
+func (gs *GameSimulator) setSmallShooter(status uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.smallShooter = status
+	logrus.Infof("小弹丸发射器模块状态已设置为: %d", status)
+}
+
+// setBigShooter 设置大弹丸发射器模块状态
+func (gs *GameSimulator) setBigShooter(status uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.bigShooter = status
+	logrus.Infof("大弹丸发射器模块状态已设置为: %d", status)
+}
+
+// setUwb 设置UWB模块状态
+func (gs *GameSimulator) setUwb(status uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.uwb = status
+	logrus.Infof("UWB模块状态已设置为: %d", status)
+}
+
+// setArmor 设置装甲模块状态
+func (gs *GameSimulator) setArmor(status uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.armor = status
+	logrus.Infof("装甲模块状态已设置为: %d", status)
+}
+
+// setVideoTransmission 设置图传模块状态
+func (gs *GameSimulator) setVideoTransmission(status uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.videoTransmission = status
+	logrus.Infof("图传模块状态已设置为: %d", status)
+}
+
+// setCapacitor 设置电容模块状态
+func (gs *GameSimulator) setCapacitor(status uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.capacitor = status
+	logrus.Infof("电容模块状态已设置为: %d", status)
+}
+
+// setMainController 设置主控模块状态
+func (gs *GameSimulator) setMainController(status uint32) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.mainController = status
+	logrus.Infof("主控模块状态已设置为: %d", status)
+}
+
+// stopSimulator 停止模拟器
+func (gs *GameSimulator) stopSimulator() {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.shouldStop = true
+	logrus.Info("模拟器即将停止...")
+}
+
+// shouldStopSimulator 检查是否应该停止
+func (gs *GameSimulator) shouldStopSimulator() bool {
+	gs.mu.RLock()
+	defer gs.mu.RUnlock()
+	return gs.shouldStop
+}
+
+// isPausedSafe 安全地检查是否暂停
+func (gs *GameSimulator) isPausedSafe() bool {
+	gs.mu.RLock()
+	defer gs.mu.RUnlock()
+	return gs.isPaused
+}
+
+// getCurrentStageSafe 安全地获取当前阶段
+func (gs *GameSimulator) getCurrentStageSafe() uint32 {
+	gs.mu.RLock()
+	defer gs.mu.RUnlock()
+	return gs.currentStage
+}
+
+// printStatus 打印当前状态
+func (gs *GameSimulator) printStatus() {
+	gs.mu.RLock()
+	defer gs.mu.RUnlock()
+
+	stageNames := map[uint32]string{
+		StagePreMatch:    "赛前准备",
+		StageSetup:       "备赛阶段",
+		StageBattle:      "对战阶段",
+		StageCalculating: "结算阶段",
+		StageFinished:    "比赛结束",
+	}
+
+	fmt.Println("\n========== 当前比赛状态 ==========")
+	fmt.Printf("局数: %d/%d\n", gs.currentRound, gs.totalRounds)
+	fmt.Printf("比分: 红方 %d : %d 蓝方\n", gs.redScore, gs.blueScore)
+	fmt.Printf("阶段: %s (%d)\n", stageNames[gs.currentStage], gs.currentStage)
+	fmt.Printf("已过时间: %d 秒\n", gs.getStageElapsedTimeUnsafe())
+
+	duration, exists := stageDurations[gs.currentStage]
+	if exists {
+		remaining := duration - gs.getStageElapsedTimeUnsafe()
+		if remaining < 0 {
+			remaining = 0
+		}
+		fmt.Printf("剩余时间: %d 秒\n", remaining)
+	}
+
+	if gs.isPaused {
+		fmt.Println("状态: 已暂停")
+	} else {
+		fmt.Println("状态: 进行中")
+	}
+	fmt.Println("==================================\n")
+}
+
+// handleConsoleCommands 处理控制台命令
+func (gs *GameSimulator) handleConsoleCommands() {
+	scanner := bufio.NewScanner(os.Stdin)
+
+	fmt.Println("\n========== 控制台指令帮助 ==========")
+	fmt.Println("help              - 显示此帮助信息")
+	fmt.Println("status            - 显示当前比赛状态")
+	fmt.Println("pause             - 切换暂停/继续")
+	fmt.Println("reset             - 重置比赛")
+	fmt.Println("red <分数>        - 设置红方得分")
+	fmt.Println("blue <分数>       - 设置蓝方得分")
+	fmt.Println("round <局号>      - 设置当前局号")
+	fmt.Println("total <总局数>    - 设置总局数")
+	fmt.Println("stage <阶段>      - 设置阶段 (0-4)")
+	fmt.Println("  0: 赛前准备  1: 备赛  2: 对战  3: 结算  4: 结束")
+	fmt.Println("\nGlobalUnitStatus 参数:")
+	fmt.Println("base <血量>           - 设置基地血量")
+	fmt.Println("basestatus <状态>     - 设置基地状态")
+	fmt.Println("baseshield <护盾>     - 设置基地护盾")
+	fmt.Println("outpost <血量>        - 设置前哨站血量")
+	fmt.Println("outpoststatus <状态>  - 设置前哨站状态")
+	fmt.Println("robot <ID> <血量>     - 设置机器人血量 (ID: 0-13)")
+	fmt.Println("bullets <ID> <数量>   - 设置机器人子弹数 (ID: 0-13)")
+	fmt.Println("damagered <伤害>      - 设置红方总伤害")
+	fmt.Println("damageblue <伤害>     - 设置蓝方总伤害")
+	fmt.Println("\nGlobalLogisticsStatus 参数:")
+	fmt.Println("economy <数量>    - 设置剩余经济")
+	fmt.Println("totaleco <数量>   - 设置总获得经济")
+	fmt.Println("tech <等级>       - 设置科技等级")
+	fmt.Println("encrypt <等级>    - 设置加密等级")
+	fmt.Println("\nRobotModuleStatus 参数:")
+	fmt.Println("powermanager <状态>      - 设置电源管理模块状态")
+	fmt.Println("rfid <状态>              - 设置RFID模块状态")
+	fmt.Println("lightstrip <状态>        - 设置灯条模块状态")
+	fmt.Println("smallshooter <状态>      - 设置小弹丸发射器模块状态")
+	fmt.Println("bigshooter <状态>        - 设置大弹丸发射器模块状态")
+	fmt.Println("uwb <状态>               - 设置UWB模块状态")
+	fmt.Println("armor <状态>             - 设置装甲模块状态")
+	fmt.Println("videotrans <状态>        - 设置图传模块状态")
+	fmt.Println("capacitor <状态>         - 设置电容模块状态")
+	fmt.Println("mainctrl <状态>          - 设置主控模块状态")
+	fmt.Println("\nstop              - 停止模拟器")
+	fmt.Println("=====================================\n")
+
+	for scanner.Scan() {
+		input := strings.TrimSpace(scanner.Text())
+		if input == "" {
+			continue
+		}
+
+		parts := strings.Fields(input)
+		cmd := strings.ToLower(parts[0])
+
+		switch cmd {
+		case "help":
+			fmt.Println("\n========== 控制台指令帮助 ==========")
+			fmt.Println("help              - 显示此帮助信息")
+			fmt.Println("status            - 显示当前比赛状态")
+			fmt.Println("pause             - 切换暂停/继续")
+			fmt.Println("reset             - 重置比赛")
+			fmt.Println("red <分数>        - 设置红方得分")
+			fmt.Println("blue <分数>       - 设置蓝方得分")
+			fmt.Println("round <局号>      - 设置当前局号")
+			fmt.Println("total <总局数>    - 设置总局数")
+			fmt.Println("stage <阶段>      - 设置阶段 (0-4)")
+			fmt.Println("  0: 赛前准备  1: 备赛  2: 对战  3: 结算  4: 结束")
+			fmt.Println("\nGlobalUnitStatus 参数:")
+			fmt.Println("base <血量>           - 设置基地血量")
+			fmt.Println("basestatus <状态>     - 设置基地状态")
+			fmt.Println("baseshield <护盾>     - 设置基地护盾")
+			fmt.Println("outpost <血量>        - 设置前哨站血量")
+			fmt.Println("outpoststatus <状态>  - 设置前哨站状态")
+			fmt.Println("robot <ID> <血量>     - 设置机器人血量 (ID: 0-13)")
+			fmt.Println("bullets <ID> <数量>   - 设置机器人子弹数 (ID: 0-13)")
+			fmt.Println("damagered <伤害>      - 设置红方总伤害")
+			fmt.Println("damageblue <伤害>     - 设置蓝方总伤害")
+			fmt.Println("\nGlobalLogisticsStatus 参数:")
+			fmt.Println("economy <数量>    - 设置剩余经济")
+			fmt.Println("totaleco <数量>   - 设置总获得经济")
+			fmt.Println("tech <等级>       - 设置科技等级")
+			fmt.Println("encrypt <等级>    - 设置加密等级")
+			fmt.Println("\nstop              - 停止模拟器")
+			fmt.Println("=====================================\n")
+
+		case "status":
+			gs.printStatus()
+
+		case "pause":
+			gs.togglePause()
+
+		case "reset":
+			gs.resetMatch()
+
+		case "red":
+			if len(parts) < 2 {
+				fmt.Println("用法: red <分数>")
+				continue
+			}
+			score, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的分数: %s\n", parts[1])
+				continue
+			}
+			gs.setRedScore(uint32(score))
+
+		case "blue":
+			if len(parts) < 2 {
+				fmt.Println("用法: blue <分数>")
+				continue
+			}
+			score, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的分数: %s\n", parts[1])
+				continue
+			}
+			gs.setBlueScore(uint32(score))
+
+		case "round":
+			if len(parts) < 2 {
+				fmt.Println("用法: round <局号>")
+				continue
+			}
+			round, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的局号: %s\n", parts[1])
+				continue
+			}
+			gs.setCurrentRound(uint32(round))
+
+		case "total":
+			if len(parts) < 2 {
+				fmt.Println("用法: total <总局数>")
+				continue
+			}
+			total, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的总局数: %s\n", parts[1])
+				continue
+			}
+			gs.setTotalRounds(uint32(total))
+
+		case "stage":
+			if len(parts) < 2 {
+				fmt.Println("用法: stage <阶段> (0-4)")
+				continue
+			}
+			stage, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的阶段: %s\n", parts[1])
+				continue
+			}
+			gs.setStage(uint32(stage))
+
+		case "base":
+			if len(parts) < 2 {
+				fmt.Println("用法: base <血量>")
+				continue
+			}
+			health, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的血量: %s\n", parts[1])
+				continue
+			}
+			gs.setBaseHealth(uint32(health))
+
+		case "basestatus":
+			if len(parts) < 2 {
+				fmt.Println("用法: basestatus <状态>")
+				continue
+			}
+			status, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的状态: %s\n", parts[1])
+				continue
+			}
+			gs.setBaseStatus(uint32(status))
+
+		case "baseshield":
+			if len(parts) < 2 {
+				fmt.Println("用法: baseshield <护盾>")
+				continue
+			}
+			shield, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的护盾: %s\n", parts[1])
+				continue
+			}
+			gs.setBaseShield(uint32(shield))
+
+		case "outpost":
+			if len(parts) < 2 {
+				fmt.Println("用法: outpost <血量>")
+				continue
+			}
+			health, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的血量: %s\n", parts[1])
+				continue
+			}
+			gs.setOutpostHealth(uint32(health))
+
+		case "outpoststatus":
+			if len(parts) < 2 {
+				fmt.Println("用法: outpoststatus <状态>")
+				continue
+			}
+			status, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的状态: %s\n", parts[1])
+				continue
+			}
+			gs.setOutpostStatus(uint32(status))
+
+		case "robot":
+			if len(parts) < 3 {
+				fmt.Println("用法: robot <ID> <血量>")
+				continue
+			}
+			robotID, err := strconv.Atoi(parts[1])
+			if err != nil {
+				fmt.Printf("无效的机器人ID: %s\n", parts[1])
+				continue
+			}
+			health, err := strconv.ParseUint(parts[2], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的血量: %s\n", parts[2])
+				continue
+			}
+			gs.setRobotHealth(robotID, uint32(health))
+
+		case "bullets":
+			if len(parts) < 3 {
+				fmt.Println("用法: bullets <ID> <数量>")
+				continue
+			}
+			robotID, err := strconv.Atoi(parts[1])
+			if err != nil {
+				fmt.Printf("无效的机器人ID: %s\n", parts[1])
+				continue
+			}
+			bullets, err := strconv.ParseInt(parts[2], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的子弹数: %s\n", parts[2])
+				continue
+			}
+			gs.setRobotBullets(robotID, int32(bullets))
+
+		case "economy":
+			if len(parts) < 2 {
+				fmt.Println("用法: economy <数量>")
+				continue
+			}
+			economy, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的经济数量: %s\n", parts[1])
+				continue
+			}
+			gs.setRemainingEconomy(uint32(economy))
+
+		case "totaleco":
+			if len(parts) < 2 {
+				fmt.Println("用法: totaleco <数量>")
+				continue
+			}
+			economy, err := strconv.ParseUint(parts[1], 10, 64)
+			if err != nil {
+				fmt.Printf("无效的经济数量: %s\n", parts[1])
+				continue
+			}
+			gs.setTotalEconomyObtained(economy)
+
+		case "tech":
+			if len(parts) < 2 {
+				fmt.Println("用法: tech <等级>")
+				continue
+			}
+			level, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的科技等级: %s\n", parts[1])
+				continue
+			}
+			gs.setTechLevel(uint32(level))
+
+		case "encrypt":
+			if len(parts) < 2 {
+				fmt.Println("用法: encrypt <等级>")
+				continue
+			}
+			level, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的加密等级: %s\n", parts[1])
+				continue
+			}
+			gs.setEncryptionLevel(uint32(level))
+
+		case "damagered":
+			if len(parts) < 2 {
+				fmt.Println("用法: damagered <伤害>")
+				continue
+			}
+			damage, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的伤害值: %s\n", parts[1])
+				continue
+			}
+			gs.setTotalDamageRed(uint32(damage))
+
+		case "damageblue":
+			if len(parts) < 2 {
+				fmt.Println("用法: damageblue <伤害>")
+				continue
+			}
+			damage, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的伤害值: %s\n", parts[1])
+				continue
+			}
+			gs.setTotalDamageBlue(uint32(damage))
+
+		case "stop":
+			gs.stopSimulator()
+			return
+
+		default:
+			fmt.Printf("未知命令: %s (输入 'help' 查看帮助)\n", cmd)
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		logrus.Errorf("读取输入错误: %v", err)
+	}
+}
+
+func Publish() {
+	simulator := NewGameSimulator(3) // 3局2胜制
+	epoch := 0
+	ticker := time.NewTicker(1000 / 150 * time.Millisecond) // 150Hz
+	defer ticker.Stop()
+
+	logrus.Info("比赛模拟器启动 - 3局2胜制")
+	logrus.Info("输入 'help' 查看控制台命令")
+
+	// 启动控制台命令监听器
+	go simulator.handleConsoleCommands()
+
+	for range ticker.C {
+		// 检查是否应该停止
+		if simulator.shouldStopSimulator() {
+			logrus.Info("模拟器已停止")
+			break
+		}
+
+		epoch++
+
+		// 更新比赛阶段
+		if !simulator.isPausedSafe() && epoch%150 == 0 { // 每秒检查一次
+			simulator.updateStage()
+		}
+
+		// 模拟随机暂停（低概率）- 可以通过控制台命令禁用
+		if epoch%1500 == 0 && simulator.rand.Float32() < 0.05 { // 每10秒有5%概率
+			// simulator.togglePause() // 取消注释以启用随机暂停
+		}
+
+		// 5Hz 发布游戏状态
+		if epoch%30 == 0 {
+			status := simulator.getGameStatus()
+			out, err := proto.Marshal(status)
+			if err != nil {
+				logrus.Warnf("pb序列化失败: %v", err)
+				continue
+			}
+			err = server.Publish("GameStatus", out, false, 0)
+			if err != nil {
+				logrus.Warnf("MQTT发布失败: %v", err)
+			}
+		}
+
+		// 10Hz 发布全局单位状态
+		if epoch%15 == 0 {
+			unitStatus := simulator.getGlobalUnitStatus()
+			out, err := proto.Marshal(unitStatus)
+			if err != nil {
+				logrus.Warnf("GlobalUnitStatus pb序列化失败: %v", err)
+				continue
+			}
+			err = server.Publish("GlobalUnitStatus", out, false, 0)
+			if err != nil {
+				logrus.Warnf("GlobalUnitStatus MQTT发布失败: %v", err)
+			}
+		}
+
+		// 10Hz 发布全局物流状态
+		if epoch%15 == 0 {
+			logisticsStatus := simulator.getGlobalLogisticsStatus()
+			out, err := proto.Marshal(logisticsStatus)
+			if err != nil {
+				logrus.Warnf("GlobalLogisticsStatus pb序列化失败: %v", err)
+				continue
+			}
+			err = server.Publish("GlobalLogisticsStatus", out, false, 0)
+			if err != nil {
+				logrus.Warnf("GlobalLogisticsStatus MQTT发布失败: %v", err)
+			}
+		}
+
+		// 10Hz 发布机器人模块状态
+		if epoch%15 == 0 {
+			moduleStatus := simulator.getRobotModuleStatus()
+			out, err := proto.Marshal(moduleStatus)
+			if err != nil {
+				logrus.Warnf("RobotModuleStatus pb序列化失败: %v", err)
+				continue
+			}
+			err = server.Publish("RobotModuleStatus", out, false, 0)
+			if err != nil {
+				logrus.Warnf("RobotModuleStatus MQTT发布失败: %v", err)
+			}
+		}
+
+		// 比赛自然结束时的处理
+		if simulator.getCurrentStageSafe() == StageFinished && epoch%150 == 0 {
+			simulator.mu.RLock()
+			redScore := simulator.redScore
+			blueScore := simulator.blueScore
+			simulator.mu.RUnlock()
+
+			logrus.Infof("比赛自然结束! 最终比分 红:%d 蓝:%d", redScore, blueScore)
+			logrus.Info("输入 'reset' 重新开始比赛,或输入 'stop' 退出模拟器")
+			// 不自动退出，等待用户命令
+		}
+	}
+}

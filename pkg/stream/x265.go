@@ -83,7 +83,7 @@ func NewX265Encoder(cfg EncoderConfig) (*X265Encoder, error) {
 		cmd:       cmd,
 		stdin:     stdin,
 		stdout:    stdout,
-		frameChan: make(chan []byte, 100),
+		frameChan: make(chan []byte, 30), // 缓冲GOP大小的帧
 		errChan:   make(chan error, 1),
 	}
 
@@ -95,7 +95,7 @@ func NewX265Encoder(cfg EncoderConfig) (*X265Encoder, error) {
 
 // 后台持续读取 stdout，不会阻塞 stdin
 func (e *X265Encoder) captureOutput() {
-	buf := make([]byte, 32*1024)
+	buf := make([]byte, 64*1024) // 增大缓冲区处理大帧
 
 	for {
 		n, err := e.stdout.Read(buf)
@@ -109,12 +109,8 @@ func (e *X265Encoder) captureOutput() {
 			}
 			e.headersMu.Unlock()
 
-			// 将 HEVC NAL 包发送出去
-			select {
-			case e.frameChan <- data:
-			default:
-				// 如果满了就丢，避免阻塞
-			}
+			// 阻塞发送，确保不丢帧
+			e.frameChan <- data
 		}
 
 		if err != nil {
@@ -134,34 +130,37 @@ func (e *X265Encoder) GetHeaders() ([]byte, error) {
 	return nil, nil
 }
 
-// 写入帧 —— 始终不会阻塞
+// 写入帧 —— 带超时的阻塞读取
 func (e *X265Encoder) EncodeFrame(mat gocv.Mat) ([]byte, error) {
 	if mat.Empty() {
 		return nil, fmt.Errorf("空帧")
 	}
-	
+
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	
+
 	data := mat.ToBytes()
 	expected := e.cfg.Width * e.cfg.Height * 3
 	if len(data) != expected {
 		return nil, fmt.Errorf("帧大小不匹配, 期望 %d, 实际 %d", expected, len(data))
 	}
-	
+
 	_, err := e.stdin.Write(data)
 	if err != nil {
 		return nil, fmt.Errorf("写入失败: %w", err)
 	}
-	
+
 	e.frameCount++
 	e.pts++
-	
-	// 🔥 这里不阻塞，直接非阻塞读取 frameChan
+
+	// 非阻塞读取 - ffmpeg有内部缓冲，不是每帧都立即输出
 	select {
 	case out := <-e.frameChan:
 		return out, nil
+	case err := <-e.errChan:
+		return nil, err
 	default:
+		// 编码器缓冲中，正常现象
 		return nil, nil
 	}
 }
