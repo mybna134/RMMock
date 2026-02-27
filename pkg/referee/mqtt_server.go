@@ -326,6 +326,17 @@ type RuneActivateCommandHook struct {
 	simulator *GameSimulator
 }
 
+// RobotPerformanceSelectionHook 性能体系选择指令处理钩子
+type RobotPerformanceSelectionHook struct {
+	mqtt.HookBase
+	simulator *GameSimulator
+}
+
+type CommonCommandHook struct {
+	mqtt.HookBase
+	simulator *GameSimulator
+}
+
 // ID 返回 hook 的唯一标识
 func (h *RuneActivateCommandHook) ID() string {
 	return "rune-activate-command"
@@ -396,6 +407,8 @@ func StartMqttServer(wg *sync.WaitGroup, simulator *GameSimulator) {
 	_ = server.AddHook(&AirSupportCommandHook{simulator: simulator}, nil)
 	_ = server.AddHook(&DartCommandHook{simulator: simulator}, nil)
 	_ = server.AddHook(&RuneActivateCommandHook{simulator: simulator}, nil)
+	_ = server.AddHook(&RobotPerformanceSelectionHook{simulator: simulator}, nil)
+	_ = server.AddHook(&CommonCommandHook{simulator: simulator}, nil)
 	tcp := listeners.NewTCP(listeners.Config{ID: "t1", Address: ":3333"})
 	err := server.AddListener(tcp)
 	if err != nil {
@@ -410,4 +423,84 @@ func StartMqttServer(wg *sync.WaitGroup, simulator *GameSimulator) {
 	}()
 
 	<-done
+}
+
+// ID 返回 RobotPerformanceSelectionHook 的唯一标识
+func (h *RobotPerformanceSelectionHook) ID() string {
+	return "robot-performance-selection"
+}
+
+// Provides 声明这个 hook 提供的功能
+func (h *RobotPerformanceSelectionHook) Provides(b byte) bool {
+	return b == mqtt.OnPublished
+}
+
+// OnPublished 当消息发布完成后触发
+func (h *RobotPerformanceSelectionHook) OnPublished(cl *mqtt.Client, pk packets.Packet) {
+	// 仅处理 RobotPerformanceSelectionCommand 主题
+	if pk.TopicName != "RobotPerformanceSelectionCommand" {
+		return
+	}
+
+	// 反序列化消息
+	var cmd rmcp.RobotPerformanceSelectionCommand
+	if err := proto.Unmarshal(pk.Payload, &cmd); err != nil {
+		logrus.Errorf("解析 RobotPerformanceSelectionCommand 失败: %v", err)
+		return
+	}
+
+	logrus.Infof("收到性能体系选择指令: shooter=%d, chassis=%d, sentry_control=%d",
+		cmd.Shooter, cmd.Chassis, cmd.SentryControl)
+
+	// 处理指令并检查是否需要立即发送响应
+	shouldSendImmediately := h.simulator.handleRobotPerformanceSelectionCommand(cmd.Shooter, cmd.Chassis, cmd.SentryControl)
+
+	if shouldSendImmediately {
+		// 立即发送 RobotPerformanceSelectionSync
+		status := h.simulator.getRobotPerformanceSelectionSync()
+		out, err := proto.Marshal(status)
+		if err != nil {
+			logrus.Errorf("序列化 RobotPerformanceSelectionSync 失败: %v", err)
+			return
+		}
+
+		err = server.Publish("RobotPerformanceSelectionSync", out, false, 0)
+		if err != nil {
+			logrus.Errorf("发布 RobotPerformanceSelectionSync 失败: %v", err)
+			return
+		}
+
+		logrus.Infof("已发送 RobotPerformanceSelectionSync: shooter=%d, chassis=%d",
+			status.Shooter, status.Chassis)
+	}
+}
+
+// ID 返回 CommonCommandHook 的唯一标识
+func (h *CommonCommandHook) ID() string {
+	return "common-command"
+}
+
+// Provides 声明这个 hook 提供的功能
+func (h *CommonCommandHook) Provides(b byte) bool {
+	return b == mqtt.OnPublished
+}
+
+// OnPublished 当消息发布完成后触发
+func (h *CommonCommandHook) OnPublished(cl *mqtt.Client, pk packets.Packet) {
+	// 仅处理 CommonCommand 主题
+	if pk.TopicName != "CommonCommand" {
+		return
+	}
+
+	// 反序列化消息
+	var cmd rmcp.CommonCommand
+	if err := proto.Unmarshal(pk.Payload, &cmd); err != nil {
+		logrus.Errorf("解析 CommonCommand 失败: %v", err)
+		return
+	}
+
+	logrus.Infof("收到通用指令: cmd_type=%d, param=%d", cmd.CmdType, cmd.Param)
+
+	// 处理指令
+	h.simulator.handleCommonCommand(cmd.CmdType, cmd.Param)
 }

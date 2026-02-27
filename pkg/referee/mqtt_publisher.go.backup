@@ -25,29 +25,6 @@ const (
 	StageCalculating  = 5 // 比赛结算中
 )
 
-// 弹药兑换价格和限制常量
-const (
-	// 17mm弹药价格 (非远程): 10金币/10发 = 1金币/发
-	NonRemote17mmCostPerUnit = 1  // 金币/发
-	NonRemote17mmBatchSize   = 10 // 基本批量
-
-	// 17mm弹药价格 (远程): 150金币/100发 = 1.5金币/发
-	Remote17mmCostPerUnit = 15  // 存储为15金币/10发，避免浮点计算
-	Remote17mmBatchSize   = 100 // 基本批量
-
-	// 42mm弹药价格 (非远程): 10金币/1发
-	NonRemote42mmCostPerUnit = 10 // 金币/发
-	NonRemote42mmBatchSize   = 1  // 基本批量
-
-	// 42mm弹药价格 (远程): 150金币/10发
-	Remote42mmCostPerUnit = 150 // 金币/10发 (150金币每10发)
-	Remote42mmBatchSize   = 10  // 基本批量
-
-	// 每局弹药限制
-	Max17mmAmmoPerMatch = 1000 // 每局最多1000发17mm
-	Max42mmAmmoPerMatch = 100  // 每局最多100发42mm
-)
-
 // 各阶段持续时间（秒）
 var stageDurations = map[uint32]int32{
 	StageNotStarted:   0,   // 未开始比赛(需手动切换)
@@ -84,25 +61,11 @@ type GameSimulator struct {
 	totalDamageRed  uint32
 	totalDamageBlue uint32
 
-	// 敌方单位状态字段
-	enemyBaseHealth    uint32
-	enemyBaseStatus    uint32
-	enemyBaseShield    uint32
-	enemyOutpostHealth uint32
-	enemyOutpostStatus uint32
-	totalDamageEnemy   uint32
-
 	// GlobalLogisticsStatus 相关字段
 	remainingEconomy     uint32
 	totalEconomyObtained uint64
 	techLevel            uint32
 	encryptionLevel      uint32
-
-	// 每局弹药跟踪字段 (按类型和方式分别跟踪)
-	perMatchNonRemote17mmAmmoExchanged uint32 // 本局已兑换的17mm弹药数量(非远程)
-	perMatchRemote17mmAmmoExchanged    uint32 // 本局已兑换的17mm弹药数量(远程)
-	perMatchNonRemote42mmAmmoExchanged uint32 // 本局已兑换的42mm弹药数量(非远程)
-	perMatchRemote42mmAmmoExchanged    uint32 // 本局已兑换的42mm弹药数量(远程)
 
 	// RobotModuleStatus 相关字段
 	powerManager      uint32
@@ -146,7 +109,6 @@ type GameSimulator struct {
 	staticRobotType                uint32
 	staticPerformanceSystemShooter uint32
 	staticPerformanceSystemChassis uint32
-	staticSentryControlMode        uint32
 	staticLevel                    uint32
 	staticMaxHealth                uint32
 	staticMaxHeat                  uint32
@@ -296,12 +258,6 @@ func NewGameSimulator(totalRounds uint32) *GameSimulator {
 		totalEconomyObtained: 0,
 		techLevel:            1,
 		encryptionLevel:      0,
-
-		// 初始化弹药跟踪字段
-		perMatchNonRemote17mmAmmoExchanged: 0,
-		perMatchRemote17mmAmmoExchanged:    0,
-		perMatchNonRemote42mmAmmoExchanged: 0,
-		perMatchRemote42mmAmmoExchanged:    0,
 
 		// 初始化 RobotModuleStatus 字段 (所有模块默认正常状态 = 1)
 		powerManager:      1,
@@ -477,15 +433,12 @@ func (gs *GameSimulator) updateStage() {
 			gs.currentStage = StageBattle
 			// 初始化空中支援累积计时器
 			gs.airSupportLastAccumulation = time.Now()
-			// 发布初始可兑换发弹量Buff
-			go gs.publishInitialAmmoExchangeBuff()
 		case StageBattle:
 			gs.currentStage = StageCalculating
 			gs.calculateRoundResultUnsafe()
 		case StageCalculating:
 			if gs.currentRound < gs.totalRounds {
 				gs.currentRound++
-				gs.resetAmmoForNewRound() // 重置弹药兑换计数
 				gs.currentStage = StagePreparation
 			} else {
 				gs.currentStage = StageNotStarted
@@ -554,41 +507,6 @@ func (gs *GameSimulator) getStageCountdownUnsafe() int32 {
 	return remaining
 }
 
-// calculateRespawnGoldCost 计算复活所需金币
-func (gs *GameSimulator) calculateRespawnGoldCost() uint32 {
-	// 如果不在比赛中，使用默认值（刚开场时）
-	if gs.currentStage != StageBattle {
-		return uint32(1*80 + gs.staticLevel*20)
-	}
-
-	// 计算已过时间（秒）
-	elapsedSeconds := gs.getStageElapsedTimeUnsafe()
-	if elapsedSeconds <= 0 {
-		return uint32(1*80 + gs.staticLevel*20) // 刚开场时的默认值
-	}
-
-	// 计算剩余时间（秒）
-	stageDuration := stageDurations[StageBattle]
-	var remainingSeconds int32
-	if int32(elapsedSeconds) < stageDuration {
-		remainingSeconds = stageDuration - int32(elapsedSeconds)
-	} else {
-		remainingSeconds = 0 // 比赛结束了
-	}
-
-	// 计算金币消耗：向上取整((420-剩余时长/60)x80 + 机器人等级x20)
-	baseCost := uint32((stageDuration/60 - remainingSeconds/60) * 80)
-	levelCost := gs.staticLevel * 20
-	totalCost := baseCost + levelCost
-
-	// 确保最小值
-	if totalCost < 80 {
-		totalCost = 80
-	}
-
-	return totalCost
-}
-
 // togglePause 切换暂停状态
 func (gs *GameSimulator) togglePause() {
 	gs.mu.Lock()
@@ -629,21 +547,15 @@ func (gs *GameSimulator) getGlobalUnitStatus() *rmcp.GlobalUnitStatus {
 	defer gs.mu.RUnlock()
 
 	return &rmcp.GlobalUnitStatus{
-		BaseHealth:         gs.baseHealth,
-		BaseStatus:         gs.baseStatus,
-		BaseShield:         gs.baseShield,
-		OutpostHealth:      gs.outpostHealth,
-		OutpostStatus:      gs.outpostStatus,
-		RobotHealth:        gs.robotHealth,
-		RobotBullets:       gs.robotBullets,
-		TotalDamageRed:     gs.totalDamageRed,
-		TotalDamageBlue:    gs.totalDamageBlue,
-		EnemyBaseHealth:    gs.enemyBaseHealth,
-		EnemyBaseStatus:    gs.enemyBaseStatus,
-		EnemyBaseShield:    gs.enemyBaseShield,
-		EnemyOutpostHealth: gs.enemyOutpostHealth,
-		EnemyOutpostStatus: gs.enemyOutpostStatus,
-		TotalDamageEnemy:   gs.totalDamageEnemy,
+		BaseHealth:      gs.baseHealth,
+		BaseStatus:      gs.baseStatus,
+		BaseShield:      gs.baseShield,
+		OutpostHealth:   gs.outpostHealth,
+		OutpostStatus:   gs.outpostStatus,
+		RobotHealth:     gs.robotHealth,
+		RobotBullets:    gs.robotBullets,
+		TotalDamageRed:  gs.totalDamageRed,
+		TotalDamageBlue: gs.totalDamageBlue,
 	}
 }
 
@@ -797,52 +709,6 @@ func (gs *GameSimulator) getRobotPathPlanInfo() *rmcp.RobotPathPlanInfo {
 	}
 }
 
-// getRobotTypeByID 根据机器人ID获取机器人类型
-// 返回值: 1=英雄, 2=工程, 3=步兵, 6=空中, 7=哨兵, 8=飞镖, 9=雷达, 10=前哨站, 11=基地
-func getRobotTypeByID(robotID uint32) uint32 {
-	switch {
-	// 红方和蓝方英雄机器人
-	case robotID == 1 || robotID == 101:
-		return 1
-	// 红方和蓝方工程机器人
-	case robotID == 2 || robotID == 102:
-		return 2
-	// 红方和蓝方步兵机器人 (3-5, 103-105)
-	case (robotID >= 3 && robotID <= 5) || (robotID >= 103 && robotID <= 105):
-		return 3
-	// 红方和蓝方空中机器人
-	case robotID == 6 || robotID == 106:
-		return 6
-	// 红方和蓝方哨兵机器人
-	case robotID == 7 || robotID == 107:
-		return 7
-	// 红方和蓝方飞镖
-	case robotID == 8 || robotID == 108:
-		return 8
-	// 红方和蓝方雷达
-	case robotID == 9 || robotID == 109:
-		return 9
-	// 红方和蓝方前哨站
-	case robotID == 10 || robotID == 110:
-		return 10
-	// 红方和蓝方基地
-	case robotID == 11 || robotID == 111:
-		return 11
-	default:
-		return 0 // 未知类型
-	}
-}
-
-// getRobotTeam 根据机器人ID判断所属团队
-func getRobotTeam(robotID uint32) string {
-	if robotID >= 1 && robotID <= 11 {
-		return "red"
-	} else if robotID >= 101 && robotID <= 111 {
-		return "blue"
-	}
-	return "unknown"
-}
-
 // getRaderInfoToClient 获取雷达信息
 func (gs *GameSimulator) getRaderInfoToClient() *rmcp.RaderInfoToClient {
 	gs.mu.RLock()
@@ -946,14 +812,6 @@ func (gs *GameSimulator) resetMatch() {
 	}
 	gs.totalDamageRed = 0
 	gs.totalDamageBlue = 0
-
-	// 初始化敌方单位状态
-	gs.enemyBaseHealth = 5000
-	gs.enemyBaseStatus = 1
-	gs.enemyBaseShield = 1500
-	gs.enemyOutpostHealth = 1500
-	gs.enemyOutpostStatus = 1
-	gs.totalDamageEnemy = 0
 
 	// 重置物流状态
 	gs.remainingEconomy = 500
@@ -1141,54 +999,6 @@ func (gs *GameSimulator) setTotalDamageBlue(damage uint32) {
 	logrus.Infof("蓝方总伤害已设置为: %d", damage)
 }
 
-// setEnemyBaseHealth 设置敌方基地血量
-func (gs *GameSimulator) setEnemyBaseHealth(health uint32) {
-	gs.mu.Lock()
-	defer gs.mu.Unlock()
-	gs.enemyBaseHealth = health
-	logrus.Infof("敌方基地血量已设置为: %d", health)
-}
-
-// setEnemyBaseStatus 设置敌方基地状态
-func (gs *GameSimulator) setEnemyBaseStatus(status uint32) {
-	gs.mu.Lock()
-	defer gs.mu.Unlock()
-	gs.enemyBaseStatus = status
-	logrus.Infof("敌方基地状态已设置为: %d", status)
-}
-
-// setEnemyBaseShield 设置敌方基地护盾
-func (gs *GameSimulator) setEnemyBaseShield(shield uint32) {
-	gs.mu.Lock()
-	defer gs.mu.Unlock()
-	gs.enemyBaseShield = shield
-	logrus.Infof("敌方基地护盾已设置为: %d", shield)
-}
-
-// setEnemyOutpostHealth 设置敌方前哨站血量
-func (gs *GameSimulator) setEnemyOutpostHealth(health uint32) {
-	gs.mu.Lock()
-	defer gs.mu.Unlock()
-	gs.enemyOutpostHealth = health
-	logrus.Infof("敌方前哨站血量已设置为: %d", health)
-}
-
-// setEnemyOutpostStatus 设置敌方前哨站状态
-func (gs *GameSimulator) setEnemyOutpostStatus(status uint32) {
-	gs.mu.Lock()
-	defer gs.mu.Unlock()
-	gs.enemyOutpostStatus = status
-	logrus.Infof("敌方前哨站状态已设置为: %d", status)
-}
-
-// setTotalDamageEnemy 设置敌方总伤害
-func (gs *GameSimulator) setTotalDamageEnemy(damage uint32) {
-	gs.mu.Lock()
-	defer gs.mu.Unlock()
-	gs.totalDamageEnemy = damage
-	logrus.Infof("敌方总伤害已设置为: %d", damage)
-}
-
 // setRemainingEconomy 设置剩余经济
 func (gs *GameSimulator) setRemainingEconomy(economy uint32) {
 	gs.mu.Lock()
@@ -1350,7 +1160,7 @@ func (gs *GameSimulator) setCanPayForRespawn(canPay bool) {
 }
 
 // startRespawnSimulation 开始复活倒计时模拟
-func (gs *GameSimulator) startRespawnSimulation(goldCost uint32) {
+func (gs *GameSimulator) startRespawnSimulation(canFree bool, canPay bool) {
 	gs.mu.Lock()
 
 	// 如果已经在复活中，先停止之前的复活
@@ -1365,13 +1175,21 @@ func (gs *GameSimulator) startRespawnSimulation(goldCost uint32) {
 	gs.isPendingRespawn = true
 	gs.totalRespawnProgress = 100
 	gs.currentRespawnProgress = 0
-	gs.goldCostForRespawn = goldCost
-	gs.canFreeRespawn = false   // 初始不可免费复活
-	gs.canPayForRespawn = false // 初始不可金币复活
+	gs.canFreeRespawn = canFree
+	gs.canPayForRespawn = canPay
+
+	// 根据是否可免费复活设置金币消耗
+	if canFree {
+		gs.goldCostForRespawn = 0
+	} else if canPay {
+		gs.goldCostForRespawn = 50
+	} else {
+		gs.goldCostForRespawn = 0
+	}
 
 	gs.mu.Unlock()
 
-	logrus.Infof("开始复活倒计时模拟 - 金币消耗: %d", goldCost)
+	logrus.Infof("开始复活倒计时模拟 - 免费复活: %v, 金币复活: %v", canFree, canPay)
 
 	// 创建新的ticker和stop channel
 	gs.mu.Lock()
@@ -1390,19 +1208,10 @@ func (gs *GameSimulator) startRespawnSimulation(goldCost uint32) {
 				if gs.currentRespawnProgress < gs.totalRespawnProgress {
 					gs.currentRespawnProgress++
 					logrus.Infof("%d", gs.currentRespawnProgress)
-
-					// 检查金币是否满足条件
-					if !gs.canPayForRespawn && gs.remainingEconomy >= gs.goldCostForRespawn {
-						gs.canPayForRespawn = true
-						logrus.Infof("金币已满足条件，现在可以金币复活 (需要: %d, 当前: %d)",
-							gs.goldCostForRespawn, gs.remainingEconomy)
-					}
-
 					if gs.currentRespawnProgress >= gs.totalRespawnProgress {
-						logrus.Info("复活倒计时完成!")
-						// 设置可免费复活（按照用户要求不更改待复活状态）
-						gs.canFreeRespawn = true
-						logrus.Info("现在可以免费复活")
+						logrus.Info("复活完成!")
+						gs.isPendingRespawn = false
+						gs.currentRespawnProgress = gs.totalRespawnProgress
 					}
 				}
 				gs.mu.Unlock()
@@ -1429,18 +1238,6 @@ func (gs *GameSimulator) stopRespawnSimulation() {
 	gs.currentRespawnProgress = 0
 
 	logrus.Info("复活倒计时已停止")
-}
-
-// completeRespawn 完成复活
-func (gs *GameSimulator) completeRespawn() {
-	// 设置复活完成状态
-	gs.isPendingRespawn = false
-	gs.currentRespawnProgress = gs.totalRespawnProgress
-
-	// 可选：恢复机器人生命值等状态
-	// TODO: 根据需要添加机器人状态恢复逻辑
-
-	logrus.Info("复活完成")
 }
 
 // setInjuryTotalDamage 设置总伤害
@@ -1547,231 +1344,36 @@ func (gs *GameSimulator) setStaticAliveState(state uint32) {
 	logrus.Infof("机器人存活状态已设置为: %d", state)
 }
 
-// setStaticRobotId 设置机器人ID并同步更新相关类型信息
+// setStaticRobotId 设置机器人ID
 func (gs *GameSimulator) setStaticRobotId(id uint32) {
 	gs.mu.Lock()
 	defer gs.mu.Unlock()
-
-	// 更新机器人ID
 	gs.staticRobotId = id
-
-	// 根据ID更新机器人类型
-	gs.staticRobotType = getRobotTypeByID(id)
-
-	logrus.Infof("机器人ID已设置为: %d, 自动推断的类型为: %d, 团队: %s",
-		id, gs.staticRobotType, getRobotTeam(id))
+	logrus.Infof("机器人ID已设置为: %d", id)
 }
 
-// getCurrentRobotType 获取当前模拟机器人的类型（基于ID）
-// 无锁版本：由于staticRobotId的修改已经在setStaticRobotId中同步，
-// 且getRobotTypeByID函数是无副作用的纯函数，所以这里不需要加锁
-func (gs *GameSimulator) getCurrentRobotType() uint32 {
-	return getRobotTypeByID(gs.staticRobotId)
-}
-
-// getCurrentRobotTeam 获取当前模拟机器人的团队（基于ID）
-// 无锁版本：原因同上
-func (gs *GameSimulator) getCurrentRobotTeam() string {
-	return getRobotTeam(gs.staticRobotId)
-}
-
-// setStaticRobotType 设置机器人类型（不推荐使用，请使用setStaticRobotId）
+// setStaticRobotType 设置机器人类型
 func (gs *GameSimulator) setStaticRobotType(robotType uint32) {
 	gs.mu.Lock()
 	defer gs.mu.Unlock()
 	gs.staticRobotType = robotType
-	logrus.Warnf("警告: 直接设置机器人类型已过时，建议使用setStaticRobotId方法")
 	logrus.Infof("机器人类型已设置为: %d", robotType)
 }
 
 // setStaticPerformanceSystemShooter 设置射手性能系统
 func (gs *GameSimulator) setStaticPerformanceSystemShooter(perf uint32) {
-	// 使用性能体系选择处理函数进行验证和设置
-	gs.handleRobotPerformanceSelectionCommand(perf, 0, 0)
-
-	logrus.Infof("射手性能系统设置请求: %d", perf)
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.staticPerformanceSystemShooter = perf
+	logrus.Infof("射手性能系统已设置为: %d", perf)
 }
 
 // setStaticPerformanceSystemChassis 设置底盘性能系统
 func (gs *GameSimulator) setStaticPerformanceSystemChassis(perf uint32) {
-	// 使用性能体系选择处理函数进行验证和设置
-	gs.handleRobotPerformanceSelectionCommand(0, perf, 0)
-
-	logrus.Infof("底盘性能系统设置请求: %d", perf)
-}
-
-// setStaticSentryControlMode 设置哨兵控制模式
-func (gs *GameSimulator) setStaticSentryControlMode(mode uint32) {
-	gs.mu.Lock()
-	gs.staticSentryControlMode = mode
-	var savedMode = mode
-	gs.mu.Unlock()
-	logrus.Infof("哨兵控制模式已设置为: %d", mode)
-
-	// 发送RobotPerformanceSelectionSync消息（使用不加锁版本）
-	gs.publishRobotPerformanceSelectionSyncUnsafe()
-
-	// 再次确认，确保值已设置（可选）
-	if savedMode != gs.staticSentryControlMode {
-		logrus.Warnf("哨兵控制模式值可能被其他goroutine修改: 期望=%d, 实际=%d",
-			savedMode, gs.staticSentryControlMode)
-	}
-}
-
-// isValidHeroPerformanceSystem 验证英雄机器人性能系统
-func (gs *GameSimulator) isValidHeroPerformanceSystem(systemType uint32) bool {
-	return systemType == 3 || systemType == 4 // 3=英雄近战优先, 4=英雄远程优先
-}
-
-// isValidInfantryPerformanceSystem 验证步兵机器人性能系统
-func (gs *GameSimulator) isValidInfantryPerformanceSystem(systemType uint32) bool {
-	return systemType == 1 || systemType == 2 // 1=冷却优先, 2=爆发优先
-}
-
-// handleRobotPerformanceSelectionCommand 处理性能体系选择指令
-func (gs *GameSimulator) handleRobotPerformanceSelectionCommand(shooter, chassis, sentryControl uint32) bool {
-	// 获取当前机器人类型
-	robotType := gs.getCurrentRobotType()
-
 	gs.mu.Lock()
 	defer gs.mu.Unlock()
-	shouldPublish := false
-
-	logrus.Infof("处理性能体系选择指令: 机器人类型=%d, shooter=%d, chassis=%d, sentry_control=%d",
-		robotType, shooter, chassis, sentryControl)
-
-	switch robotType {
-	case 1: // 英雄 (包含红方1和蓝方101，通过getRobotTypeByID()统一返回1)
-		// 英雄机器人只能设置性能体系 3/4 (整体性能体系)
-		if shooter != gs.staticPerformanceSystemShooter || chassis != gs.staticPerformanceSystemChassis {
-			if gs.isValidHeroPerformanceSystem(shooter) && gs.isValidHeroPerformanceSystem(chassis) {
-				// 英雄机器人的发射机构和底盘性能必须相同 (3/4)
-				if shooter == chassis || shooter == 0 || chassis == 0 {
-					// 如果其中一个为0，则使用另一个的值
-					if shooter == 0 && chassis != 0 {
-						shooter = chassis
-					} else if chassis == 0 && shooter != 0 {
-						chassis = shooter
-					}
-					gs.staticPerformanceSystemShooter = shooter
-					gs.staticPerformanceSystemChassis = chassis
-					shouldPublish = true
-					logrus.Infof("英雄机器人性能体系已更新: shooter=%d, chassis=%d", shooter, chassis)
-				} else {
-					logrus.Warnf("英雄机器人性能体系设置失败: 发射机构和底盘性能需要相同 (shooter=%d!=chassis=%d)", shooter, chassis)
-				}
-			} else {
-				logrus.Warnf("英雄机器人性能体系设置失败: 无效的性能体系 shooter=%d, chassis=%d (只允许3/4)", shooter, chassis)
-			}
-		}
-
-	case 3: // 步兵 (包含红方3-5和蓝方103-105，通过getRobotTypeByID()统一返回3)
-		// 步兵机器人可以分别设置发射机构和底盘性能体系 1/2
-		if shooter != gs.staticPerformanceSystemShooter {
-			if gs.isValidInfantryPerformanceSystem(shooter) {
-				gs.staticPerformanceSystemShooter = shooter
-				shouldPublish = true
-				logrus.Infof("步兵机器人发射机构性能体系已更新: shooter=%d", shooter)
-			} else {
-				logrus.Warnf("步兵机器人发射机构性能体系设置失败: 无效的性能体系 shooter=%d (只允许1/2)", shooter)
-			}
-		}
-		if chassis != gs.staticPerformanceSystemChassis {
-			if gs.isValidInfantryPerformanceSystem(chassis) {
-				gs.staticPerformanceSystemChassis = chassis
-				shouldPublish = true
-				logrus.Infof("步兵机器人底盘性能体系已更新: chassis=%d", chassis)
-			} else {
-				logrus.Warnf("步兵机器人底盘性能体系设置失败: 无效的性能体系 chassis=%d (只允许1/2)", chassis)
-			}
-		}
-	case 6:
-		if sentryControl != gs.staticSentryControlMode {
-			gs.staticPerformanceSystemChassis = 0
-			gs.staticPerformanceSystemShooter = 0
-			gs.staticSentryControlMode = sentryControl
-			shouldPublish = true
-			logrus.Infof("哨兵控制模式已更新: sentry_control=%d", sentryControl)
-
-		}
-
-	default:
-		// if shooter != 0 || chassis != 0 {
-		// 	logrus.Warnf("机器人类型%d不能设置性能体系: shooter=%d, chassis=%d", robotType, shooter, chassis)
-		// }
-		// if sentryControl != 0 {
-		// 	logrus.Warnf("非云台手不能设置哨兵控制模式")
-
-		// }
-
-	}
-
-	return shouldPublish
-}
-
-// getRobotPerformanceSelectionSync 获取机器人性能体系选择同步状态
-func (gs *GameSimulator) getRobotPerformanceSelectionSync() *rmcp.RobotPerformanceSelectionSync {
-	gs.mu.RLock()
-	defer gs.mu.RUnlock()
-
-	return &rmcp.RobotPerformanceSelectionSync{
-		Shooter: gs.staticPerformanceSystemShooter,
-		Chassis: gs.staticPerformanceSystemChassis,
-	}
-}
-
-// publishRobotPerformanceSelectionSync 发布机器人性能体系选择同步状态
-func (gs *GameSimulator) publishRobotPerformanceSelectionSync() {
-	gs.mu.Lock()
-	defer gs.mu.Unlock()
-	gs.publishRobotPerformanceSelectionSyncUnsafe()
-}
-
-// publishRobotPerformanceSelectionSyncUnsafe 发布机器人性能体系选择同步状态（不加锁版本）
-func (gs *GameSimulator) publishRobotPerformanceSelectionSyncUnsafe() {
-	// 检查MQTT服务器是否已初始化
-	if server == nil {
-		logrus.Warn("MQTT服务器未初始化，跳过RobotPerformanceSelectionSync发布")
-		return
-	}
-
-	// 直接读取值，避免额外的锁操作
-	shooter := gs.staticPerformanceSystemShooter
-	chassis := gs.staticPerformanceSystemChassis
-
-	status := &rmcp.RobotPerformanceSelectionSync{
-		Shooter: shooter,
-		Chassis: chassis,
-	}
-
-	out, err := proto.Marshal(status)
-	if err != nil {
-		logrus.Errorf("序列化 RobotPerformanceSelectionSync 失败: %v", err)
-		return
-	}
-
-	err = server.Publish("RobotPerformanceSelectionSync", out, false, 0)
-	if err != nil {
-		logrus.Errorf("发布 RobotPerformanceSelectionSync 失败: %v", err)
-		return
-	}
-
-	logrus.Infof("已发布 RobotPerformanceSelectionSync: shooter=%d, chassis=%d",
-		status.Shooter, status.Chassis)
-}
-
-// SetRobotType 设置机器人类型 (用于测试，不推荐使用)
-func (gs *GameSimulator) SetRobotType(robotType uint32) {
-	gs.mu.Lock()
-	defer gs.mu.Unlock()
-	gs.staticRobotType = robotType
-	logrus.Warnf("警告: SetRobotType是测试方法，建议在实际代码中使用setStaticRobotId")
-	logrus.Infof("机器人类型已设置为: %d", robotType)
-}
-
-// SetStaticRobotType 设置机器人类型 (已存在的公共方法)
-func (gs *GameSimulator) SetStaticRobotType(robotType uint32) {
-	gs.setStaticRobotType(robotType)
+	gs.staticPerformanceSystemChassis = perf
+	logrus.Infof("底盘性能系统已设置为: %d", perf)
 }
 
 // setStaticLevel 设置机器人等级
@@ -2368,7 +1970,82 @@ func (gs *GameSimulator) startDartSwitchCooldown(targetId uint32) {
 				logrus.Infof("已发送 DartSelectTargetStatusSync: target_id=%d, open=false", nextTargetId)
 			}
 		}
-	})
+	}
+}
+
+// publishRobotDynamicStatusSync 立即发布机器人动态状态同步
+func (gs *GameSimulator) publishRobotDynamicStatusSync() {
+	status := gs.getRobotDynamicStatus()
+	out, err := proto.Marshal(status)
+	if err != nil {
+		logrus.Warnf("RobotDynamicStatus pb序列化失败: %v", err)
+		return
+	}
+	
+	err = server.Publish("RobotDynamicStatus", out, false, 0)
+	if err != nil {
+		logrus.Warnf("RobotDynamicStatus MQTT发布失败: %v", err)
+	}
+}
+
+// publishGlobalLogisticsStatusSync 立即发布全局物流状态同步
+func (gs *GameSimulator) publishGlobalLogisticsStatusSync() {
+	status := gs.getGlobalLogisticsStatus()
+	out, err := proto.Marshal(status)
+	if err != nil {
+		logrus.Warnf("GlobalLogisticsStatus pb序列化失败: %v", err)
+		return
+	}
+	
+	err = server.Publish("GlobalLogisticsStatus", out, false, 0)
+	if err != nil {
+		logrus.Warnf("GlobalLogisticsStatus MQTT发布失败: %v", err)
+	}
+}
+
+// publishRobotStaticStatusSync 立即发布机器人静态状态同步
+func (gs *GameSimulator) publishRobotStaticStatusSync() {
+	status := gs.getRobotStaticStatus()
+	out, err := proto.Marshal(status)
+	if err != nil {
+		logrus.Warnf("RobotStaticStatus pb序列化失败: %v", err)
+		return
+	}
+	
+	err = server.Publish("RobotStaticStatus", out, false, 0)
+	if err != nil {
+		logrus.Warnf("RobotStaticStatus MQTT发布失败: %v", err)
+	}
+}
+
+// publishRobotRespawnStatusSync 立即发布机器人复活状态同步
+func (gs *GameSimulator) publishRobotRespawnStatusSync() {
+	status := gs.getRobotRespawnStatus()
+	out, err := proto.Marshal(status)
+	if err != nil {
+		logrus.Warnf("RobotRespawnStatus pb序列化失败: %v", err)
+		return
+	}
+	
+	err = server.Publish("RobotRespawnStatus", out, false, 0)
+	if err != nil {
+		logrus.Warnf("RobotRespawnStatus MQTT发布失败: %v", err)
+	}
+}
+
+// publishRobotPositionSync 立即发布机器人位置同步
+func (gs *GameSimulator) publishRobotPositionSync() {
+	position := gs.getRobotPosition()
+	out, err := proto.Marshal(position)
+	if err != nil {
+		logrus.Warnf("RobotPosition pb序列化失败: %v", err)
+		return
+	}
+	
+	err = server.Publish("RobotPosition", out, false, 0)
+	if err != nil {
+		logrus.Warnf("RobotPosition MQTT发布失败: %v", err)
+	}
 }
 
 // startDartSequence 开始飞镖发射序列
@@ -3649,8 +3326,16 @@ func (gs *GameSimulator) ShouldSendVideoStream() bool {
 	gs.mu.RLock()
 	defer gs.mu.RUnlock()
 
-	// 所有机器人始终发送视频流，包括空中支援机器人
-	// 这样可以避免摄像头帧读取失败的问题
+	// 检查机器人ID是否为6或106 (无人机)
+	isAirSupportRobot := gs.staticRobotId == 6 || gs.staticRobotId == 106
+
+	// 如果是无人机,需要检查空中支援状态
+	if isAirSupportRobot {
+		// 只有在空中支援激活状态下才发送视频流
+		return gs.airSupportStatus == 1
+	}
+
+	// 其他机器人始终发送视频流
 	return true
 }
 
@@ -3717,373 +3402,308 @@ func (gs *GameSimulator) printStatus() {
 	} else {
 		fmt.Println("状态: 进行中")
 	}
-	fmt.Println("==================================")
-}
-
-// calculate17mmExchangeCost 计算17mm弹药价格和限制
-func (gs *GameSimulator) calculate17mmExchangeCost(isRemote bool, param uint32) (uint32, uint32, uint32, error) {
-	var perUnitCost uint32
-	var limit uint32
-	var totalExchanged uint32
-
-	if isRemote {
-		// 远程兑换: 15金币/10发
-		perUnitCost = uint32(NonRemote17mmCostPerUnit) // 1金币/发（单价）
-		limit = Max17mmAmmoPerMatch
-		totalExchanged = gs.perMatchRemote17mmAmmoExchanged
-	} else {
-		// 非远程兑换: 1金币/发
-		perUnitCost = uint32(NonRemote17mmCostPerUnit)
-		limit = Max17mmAmmoPerMatch
-		totalExchanged = gs.perMatchNonRemote17mmAmmoExchanged
-	}
-
-	// 计算实际成本
-	var cost uint32
-	if isRemote {
-		// 远程兑换17mm按10发一批计算: 15金币/10发
-		batches := param / 10
-		remainder := param % 10
-		if remainder > 0 {
-			batches++
-		}
-		cost = batches * uint32(Remote17mmCostPerUnit) // 每10发15金币
-	} else {
-		// 非远程按单位计算
-		cost = param * perUnitCost
-	}
-
-	// 检查是否超过本局限制
-	if totalExchanged+param > limit {
-		remainingAmmo := limit - totalExchanged
-		return cost, remainingAmmo, totalExchanged,
-			fmt.Errorf("17mm弹药超出本局限制 (已兑换: %d, 限制: %d, 尝试: %d, 剩余可兑换: %d)",
-				totalExchanged, limit, param, remainingAmmo)
-	}
-
-	return cost, param, totalExchanged, nil
-}
-
-// calculate42mmExchangeCost 计算42mm弹药价格和限制
-func (gs *GameSimulator) calculate42mmExchangeCost(isRemote bool, param uint32) (uint32, uint32, uint32, error) {
-	var perUnitCost uint32
-	var limit uint32
-	var totalExchanged uint32
-
-	if isRemote {
-		// 远程兑换: 150金币/10发 (单发15金币)
-		perUnitCost = uint32(NonRemote42mmCostPerUnit) // 10金币/发 (参考单价)
-		limit = Max42mmAmmoPerMatch
-		totalExchanged = gs.perMatchRemote42mmAmmoExchanged
-	} else {
-		// 非远程兑换: 10金币/发
-		perUnitCost = uint32(NonRemote42mmCostPerUnit)
-		limit = Max42mmAmmoPerMatch
-		totalExchanged = gs.perMatchNonRemote42mmAmmoExchanged
-	}
-
-	// 计算实际成本
-	var cost uint32
-	if isRemote {
-		// 远程兑换42mm按10发一批计算: 150金币/10发
-		batches := param / 10
-		remainder := param % 10
-		if remainder > 0 {
-			batches++
-		}
-		cost = batches * uint32(Remote42mmCostPerUnit) // 每10发150金币
-	} else {
-		// 非远程按单位计算
-		cost = param * perUnitCost
-	}
-
-	// 检查是否超过本局限制
-	if totalExchanged+param > limit {
-		remainingAmmo := limit - totalExchanged
-		return cost, remainingAmmo, totalExchanged,
-			fmt.Errorf("42mm弹药超出本局限制 (已兑换: %d, 限制: %d, 尝试: %d, 剩余可兑换: %d)",
-				totalExchanged, limit, param, remainingAmmo)
-	}
-
-	return cost, param, totalExchanged, nil
-}
-
-// process17mmAmmoExchange 处理17mm弹药兑换 (非远程)
-func (gs *GameSimulator) process17mmAmmoExchange(param uint32) {
-	// 基本状态检查
-	if gs.staticAliveState != 1 { // 1 = 存活
-		logrus.Warnf("17mm弹药兑换失败: 机器人未存活 (状态: %d)", gs.staticAliveState)
-		return
-	}
-
-	// 计算价格和检查限制
-	cost, allowedAmmo, _, err := gs.calculate17mmExchangeCost(false, param)
-	if err != nil {
-		logrus.Warnf("17mm弹药兑换失败(非远程): %v", err)
-		return
-	}
-
-	// 检查经济是否足够
-	if gs.remainingEconomy < cost {
-		logrus.Warnf("17mm弹药兑换失败(非远程): 经济不足 (当前经济: %d, 需要经济: %d)",
-			gs.remainingEconomy, cost)
-		return
-	}
-
-	// 执行兑换
-	gs.remainingEconomy -= cost
-	gs.totalEconomyObtained += uint64(cost)
-	gs.perMatchNonRemote17mmAmmoExchanged += allowedAmmo
-	gs.dynamicRemainingAmmo += allowedAmmo
-
-	logrus.Infof("17mm弹药兑换成功(非远程): 兑换数量=%d, 单价=1金币/发, 总价=%d, 本局已兑换=%d/%d, 剩余经济=%d",
-		allowedAmmo, cost, gs.perMatchNonRemote17mmAmmoExchanged, Max17mmAmmoPerMatch, gs.remainingEconomy)
-
-	// 兑换后发送更新数据
-	gs.publishAmmoExchangeUpdate()
-}
-
-// process42mmAmmoExchange 处理42mm弹药兑换 (非远程)
-func (gs *GameSimulator) process42mmAmmoExchange(param uint32) {
-	// 基本状态检查
-	if gs.staticAliveState != 1 { // 1 = 存活
-		logrus.Warnf("42mm弹药兑换失败: 机器人未存活 (状态: %d)", gs.staticAliveState)
-		return
-	}
-
-	// 机器人类型检查
-	robotType := gs.getCurrentRobotType()
-	if robotType != 1 && robotType != 7 { // 1=英雄, 7=哨兵
-		logrus.Warnf("42mm弹药兑换失败: 机器人类型不支持42mm弹药 (类型: %d)", robotType)
-		return
-	}
-
-	// 计算价格和检查限制
-	cost, allowedAmmo, _, err := gs.calculate42mmExchangeCost(false, param)
-	if err != nil {
-		logrus.Warnf("42mm弹药兑换失败(非远程): %v", err)
-		return
-	}
-
-	// 检查经济是否足够
-	if gs.remainingEconomy < cost {
-		logrus.Warnf("42mm弹药兑换失败(非远程): 经济不足 (当前经济: %d, 需要经济: %d)",
-			gs.remainingEconomy, cost)
-		return
-	}
-
-	// 执行兑换
-	gs.remainingEconomy -= cost
-	gs.totalEconomyObtained += uint64(cost)
-	gs.perMatchNonRemote42mmAmmoExchanged += allowedAmmo
-	// 注意：42mm弹药可能需要单独的字段来跟踪，这里暂时不更新dynamicRemainingAmmo
-	gs.dynamicRemainingAmmo += allowedAmmo
-
-	logrus.Infof("42mm弹药兑换成功(非远程): 兑换数量=%d, 单价=10金币/发, 总价=%d, 本局已兑换=%d/%d, 剩余经济=%d",
-		allowedAmmo, cost, gs.perMatchNonRemote42mmAmmoExchanged, Max42mmAmmoPerMatch, gs.remainingEconomy)
-
-	// 兑换后发送更新数据
-	gs.publishAmmoExchangeUpdate()
-}
-
-// processRemoteAmmoExchange 处理远程弹药兑换
-func (gs *GameSimulator) processRemoteAmmoExchange(param uint32) {
-	// 基本状态检查
-	if gs.staticAliveState != 1 { // 1 = 存活
-		logrus.Warnf("远程弹药兑换失败: 机器人未存活 (状态: %d)", gs.staticAliveState)
-		return
-	}
-
-	// 远程兑换前置条件检查 - 仅检查是否允许远程补弹
-	if !gs.dynamicCanRemoteAmmo {
-		logrus.Warnf("远程弹药兑换失败: 当前状态不允许远程弹药补给")
-		return
-	}
-
-	// 根据机器人类型确定弹药类型和价格
-	var ammoType string
-	var cost uint32
-	var allowedAmmo uint32
-	var err error
-
-	robotType := gs.getCurrentRobotType()
-	if robotType == 1 || robotType == 7 { // 1=英雄, 7=哨兵
-		// 英雄或哨兵：42mm弹药
-		cost, allowedAmmo, _, err = gs.calculate42mmExchangeCost(true, param)
-		ammoType = "42mm"
-		gs.perMatchRemote42mmAmmoExchanged += allowedAmmo
-		gs.dynamicRemainingAmmo += allowedAmmo
-	} else {
-		// 其他类型：17mm弹药
-		cost, allowedAmmo, _, err = gs.calculate17mmExchangeCost(true, param)
-		ammoType = "17mm"
-		gs.perMatchRemote17mmAmmoExchanged += allowedAmmo
-		gs.dynamicRemainingAmmo += allowedAmmo // 17mm弹药添加到通用弹药计数
-	}
-
-	if err != nil {
-		logrus.Warnf("远程%s弹药兑换失败: %v", ammoType, err)
-		return
-	}
-
-	// 检查经济是否足够
-	if gs.remainingEconomy < cost {
-		logrus.Warnf("远程%s弹药兑换失败: 经济不足 (当前经济: %d, 需要经济: %d)",
-			ammoType, gs.remainingEconomy, cost)
-		return
-	}
-
-	// 执行兑换
-	gs.remainingEconomy -= cost
-	gs.totalEconomyObtained += uint64(cost)
-
-	// 计算单价用于日志显示
-	var unitPrice uint32
-	if ammoType == "42mm" {
-		unitPrice = 15 // 150金币/10发 = 15金币/发
-	} else {
-		unitPrice = 2 // 150金币/100发 = 1.5金币/发，向上取整显示
-	}
-
-	logrus.Infof("远程%s弹药兑换成功: 兑换数量=%d, 单价≈%d金币/发, 总价=%d, 剩余经济=%d",
-		ammoType, allowedAmmo, unitPrice, cost, gs.remainingEconomy)
-
-	// 兑换后发送更新数据
-	gs.publishAmmoExchangeUpdate()
+	fmt.Println("==================================\n")
 }
 
 // handleCommonCommand 处理通用指令
 func (gs *GameSimulator) handleCommonCommand(cmdType, param uint32) {
-	logrus.Infof("处理通用指令: cmd_type=%d, param=%d", cmdType, param)
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
 
 	switch cmdType {
 	case 1:
+		// 兑换17mm发弹量
 		logrus.Infof("处理兑换17mm发弹量指令: 参数=%d", param)
 		gs.process17mmAmmoExchange(param)
 	case 2:
+		// 兑换42mm发弹量
 		logrus.Infof("处理兑换42mm发弹量指令: 参数=%d", param)
 		gs.process42mmAmmoExchange(param)
 	case 3:
+		// 确认复活
 		logrus.Infof("处理确认复活指令: 参数=%d", param)
-		gs.mu.Lock()
-		if !gs.isPendingRespawn {
-			gs.mu.Unlock()
-			logrus.Warn("确认复活失败：当前不在待复活状态")
-			return
-		}
-		if !gs.canFreeRespawn {
-			gs.mu.Unlock()
-			logrus.Warn("确认复活失败：当前不可免费复活")
-			return
-		}
-		gs.completeRespawn()
-		gs.mu.Unlock()
-		logrus.Info("免费复活成功")
+		gs.processConfirmRespawn(param)
 	case 4:
+		// 兑换立即复活
 		logrus.Infof("处理兑换立即复活指令: 参数=%d", param)
-		gs.mu.Lock()
-		if !gs.isPendingRespawn {
-			gs.mu.Unlock()
-			logrus.Warn("兑换立即复活失败：当前不在待复活状态")
-			return
-		}
-		if !gs.canPayForRespawn {
-			gs.mu.Unlock()
-			logrus.Warn("兑换立即复活失败：当前不可金币复活")
-			return
-		}
-
-		// 确保有有效的金币消耗，如果为0则计算
-		if gs.goldCostForRespawn == 0 {
-			gs.goldCostForRespawn = gs.calculateRespawnGoldCost()
-		}
-
-		// 检查金币余额
-		if gs.remainingEconomy < gs.goldCostForRespawn {
-			gs.mu.Unlock()
-			logrus.Warnf("兑换立即复活失败：金币不足 (需要: %d, 当前: %d)",
-				gs.goldCostForRespawn, gs.remainingEconomy)
-			return
-		}
-
-		// 扣除金币并复活
-		gs.remainingEconomy -= gs.goldCostForRespawn
-		gs.completeRespawn()
-		gs.mu.Unlock()
-		logrus.Infof("金币复活成功，消耗金币: %d，剩余金币: %d",
-			gs.goldCostForRespawn, gs.remainingEconomy)
+		gs.processInstantRespawn(param)
 	case 5:
+		// 远程兑换允许发弹量
 		logrus.Infof("处理远程兑换发弹量指令: 参数=%d", param)
 		gs.processRemoteAmmoExchange(param)
 	case 6:
-		logrus.Infof("处理远程兑换血量指令")
-		gs.processRemoteHealthRestore()
+		// 远程兑换血量
+		logrus.Infof("处理远程兑换血量指令: 参数=%d", param)
+		gs.processRemoteHealthExchange(param)
 	default:
 		logrus.Warnf("未知的通用指令类型: cmd_type=%d, param=%d", cmdType, param)
 	}
 }
 
-// processRemoteHealthRestore 处理远程血量恢复
-func (gs *GameSimulator) processRemoteHealthRestore() {
-	gs.mu.Lock()
-	defer gs.mu.Unlock()
+// process17mmAmmoExchange 处理17mm弹药兑换
+func (gs *GameSimulator) process17mmAmmoExchange(param uint32) {
+	// 经济成本表 (可根据需要调整)
+	const costPer17mmAmmo = 100 // 每17mm弹药100金币
 
-	// 基本状态检查
-	if gs.staticAliveState != 1 {
-		logrus.Warnf("远程血量恢复失败: 机器人未存活")
+	// 检查经济是否足够
+	if gs.remainingEconomy < costPer17mmAmmo {
+		logrus.Warnf("17mm弹药兑换失败: 经济不足 (当前经济: %d, 需要经济: %d)",
+			gs.remainingEconomy, costPer17mmAmmo)
 		return
 	}
 
-	if !gs.dynamicCanRemoteHeal {
-		logrus.Warnf("远程血量恢复失败: 当前状态不允许远程治疗")
+	// 检查机器人是否存活
+	if gs.staticAliveState != 1 { // 1 = 存活
+		logrus.Warnf("17mm弹药兑换失败: 机器人未存活 (状态: %d)", gs.staticAliveState)
 		return
 	}
 
-	// 检查金币是否足够 (固定200金币)
-	const healthRestoreCost = 200
-	if gs.remainingEconomy < healthRestoreCost {
-		logrus.Warnf("远程血量恢复失败: 金币不足 (需要: %d, 当前: %d)",
-			healthRestoreCost, gs.remainingEconomy)
-		return
-	}
+	// 扣除经济
+	gs.remainingEconomy -= costPer17mmAmmo
+	gs.totalEconomyObtained += uint64(costPer17mmAmmo)
 
-	// 计算恢复血量 (恢复到血量上限的60%)
-	maxHealth := gs.staticMaxHealth
-	targetHealth := maxHealth * 60 / 100
-	currentHealth := gs.dynamicCurrentHealth
+	// 增加弹药限制 (假设param为兑换数量)
+	gs.dynamicRemainingAmmo += param
 
-	// 如果当前血量已经达到或超过目标血量，则不需要恢复
-	if currentHealth >= targetHealth {
-		logrus.Warnf("远程血量恢复失败: 当前血量已达到或超过目标血量 (当前: %d, 目标: %d)",
-			currentHealth, targetHealth)
-		return
-	}
+	logrus.Infof("17mm弹药兑换成功: 兑换数量=%d, 剩余经济=%d, 剩余弹药=%d",
+		param, gs.remainingEconomy, gs.dynamicRemainingAmmo)
 
-	// 执行恢复
-	gs.remainingEconomy -= healthRestoreCost
-	gs.totalEconomyObtained += uint64(healthRestoreCost)
-	gs.dynamicCurrentHealth = targetHealth
-	var savedEconomy = gs.remainingEconomy
-
-	// 在锁内调用，但使用不加锁版本
-	gs.publishHealthRestoreUpdateUnsafe()
-
-	logrus.Infof("远程血量恢复成功: 消耗金币 %d, 血量从 %d 恢复到 %d, 剩余金币 %d",
-		healthRestoreCost, currentHealth, targetHealth, savedEconomy)
+	// 立即发送状态更新消息
+	gs.publishRobotDynamicStatusSync()
+	gs.publishGlobalLogisticsStatusSync()
 }
 
-// resetAmmoForNewRound 重置新回合弹药兑换计数
-func (gs *GameSimulator) resetAmmoForNewRound() {
-	gs.perMatchNonRemote17mmAmmoExchanged = 0
-	gs.perMatchRemote17mmAmmoExchanged = 0
-	gs.perMatchNonRemote42mmAmmoExchanged = 0
-	gs.perMatchRemote42mmAmmoExchanged = 0
+// process42mmAmmoExchange 处理42mm弹药兑换
+func (gs *GameSimulator) process42mmAmmoExchange(param uint32) {
+	// 经济成本表 (可根据需要调整)
+	const costPer42mmAmmo = 300 // 每42mm弹药300金币
 
-	logrus.Infof("第%d回合开始，重置所有弹药兑换计数 (17mm限制: %d发, 42mm限制: %d发)",
-		gs.currentRound, Max17mmAmmoPerMatch, Max42mmAmmoPerMatch)
+	// 检查经济是否足够
+	if gs.remainingEconomy < costPer42mmAmmo {
+		logrus.Warnf("42mm弹药兑换失败: 经济不足 (当前经济: %d, 需要经济: %d)",
+			gs.remainingEconomy, costPer42mmAmmo)
+		return
+	}
 
-	// 发布更新后的可兑换发弹量Buff
-	go gs.publishInitialAmmoExchangeBuff()
+	// 检查机器人是否存活
+	if gs.staticAliveState != 1 { // 1 = 存活
+		logrus.Warnf("42mm弹药兑换失败: 机器人未存活 (状态: %d)", gs.staticAliveState)
+		return
+	}
+
+	// 检查机器人类型是否支持42mm弹药 (英雄、哨兵等)
+	if gs.staticRobotType != 1 && gs.staticRobotType != 5 { // 1=英雄, 5=哨兵
+		logrus.Warnf("42mm弹药兑换失败: 机器人类型不支持42mm弹药 (类型: %d)", gs.staticRobotType)
+		return
+	}
+
+	// 扣除经济
+	gs.remainingEconomy -= costPer42mmAmmo
+	gs.totalEconomyObtained += uint64(costPer42mmAmmo)
+
+	// 增加弹药限制 (42mm弹药通常是单独计数，这里简化处理)
+	// 实际实现中可能需要单独的42mm弹药计数字段
+	logrus.Infof("42mm弹药兑换成功: 兑换数量=%d, 剩余经济=%d",
+		param, gs.remainingEconomy)
+
+	// TODO: 发送状态更新消息
+	// gs.publishRobotDynamicStatus()
+	// gs.publishGlobalLogisticsStatus()
+}
+
+// processConfirmRespawn 处理确认复活
+func (gs *GameSimulator) processConfirmRespawn(param uint32) {
+	// 检查是否处于待复活状态
+	if !gs.isPendingRespawn {
+		logrus.Warnf("确认复活失败: 机器人不处于待复活状态")
+		return
+	}
+
+	// 检查是否可以免费复活
+	if !gs.canFreeRespawn {
+		logrus.Warnf("确认复活失败: 无法免费复活")
+		return
+	}
+
+	// 重置复活状态
+	gs.isPendingRespawn = false
+	gs.currentRespawnProgress = 0
+	gs.totalRespawnProgress = 0
+
+	// 恢复机器人状态
+	gs.staticAliveState = 1 // 1 = 存活
+	gs.dynamicCurrentHealth = gs.staticMaxHealth
+	gs.dynamicCurrentHeat = 0
+	gs.dynamicCurrentChassisEnergy = gs.staticMaxChassisEnergy
+	gs.dynamicCurrentBufferEnergy = gs.staticMaxBufferEnergy
+
+	// 重置位置到出生点
+	gs.positionX = 0
+	gs.positionY = 0
+	gs.positionZ = 0
+	gs.positionYaw = 0
+
+	logrus.Infof("机器人免费复活成功")
+
+	// TODO: 发送状态更新消息
+	// gs.publishRobotStaticStatus()
+	// gs.publishRobotDynamicStatus()
+	// gs.publishRobotRespawnStatus()
+	// gs.publishRobotPosition()
+}
+
+// processInstantRespawn 处理立即复活
+func (gs *GameSimulator) processInstantRespawn(param uint32) {
+	// 检查是否处于待复活状态
+	if !gs.isPendingRespawn {
+		logrus.Warnf("立即复活失败: 机器人不处于待复活状态")
+		return
+	}
+
+	// 检查是否允许付费复活
+	if !gs.canPayForRespawn {
+		logrus.Warnf("立即复活失败: 不允许付费复活")
+		return
+	}
+
+	// 检查经济是否足够
+	if gs.remainingEconomy < gs.goldCostForRespawn {
+		logrus.Warnf("立即复活失败: 经济不足 (当前经济: %d, 需要金币: %d)",
+			gs.remainingEconomy, gs.goldCostForRespawn)
+		return
+	}
+
+	// 扣除金币
+	gs.remainingEconomy -= gs.goldCostForRespawn
+	gs.totalEconomyObtained += uint64(gs.goldCostForRespawn)
+
+	// 停止复活进度计时器
+	if gs.respawnTicker != nil {
+		gs.respawnTicker.Stop()
+		gs.respawnTicker = nil
+	}
+	if gs.respawnStopChan != nil {
+		close(gs.respawnStopChan)
+		gs.respawnStopChan = nil
+	}
+
+	// 重置复活状态
+	gs.isPendingRespawn = false
+	gs.currentRespawnProgress = 0
+	gs.totalRespawnProgress = 0
+
+	// 恢复机器人状态
+	gs.staticAliveState = 1 // 1 = 存活
+	gs.dynamicCurrentHealth = gs.staticMaxHealth
+	gs.dynamicCurrentHeat = 0
+	gs.dynamicCurrentChassisEnergy = gs.staticMaxChassisEnergy
+	gs.dynamicCurrentBufferEnergy = gs.staticMaxBufferEnergy
+
+	// 重置位置到出生点
+	gs.positionX = 0
+	gs.positionY = 0
+	gs.positionZ = 0
+	gs.positionYaw = 0
+
+	logrus.Infof("机器人立即复活成功 (花费金币: %d)", gs.goldCostForRespawn)
+
+	// TODO: 发送状态更新消息
+	// gs.publishRobotStaticStatus()
+	// gs.publishRobotDynamicStatus()
+	// gs.publishRobotRespawnStatus()
+	// gs.publishRobotPosition()
+	// gs.publishGlobalLogisticsStatus()
+}
+
+// processRemoteAmmoExchange 处理远程弹药兑换
+func (gs *GameSimulator) processRemoteAmmoExchange(param uint32) {
+	// 检查是否可以进行远程弹药补给
+	if !gs.dynamicCanRemoteAmmo {
+		logrus.Warnf("远程弹药兑换失败: 当前状态不允许远程弹药补给")
+		return
+	}
+
+	// 检查机器人是否存活
+	if gs.staticAliveState != 1 { // 1 = 存活
+		logrus.Warnf("远程弹药兑换失败: 机器人未存活 (状态: %d)", gs.staticAliveState)
+		return
+	}
+
+	// 检查是否处于脱战状态
+	if !gs.dynamicIsOutOfCombat {
+		logrus.Warnf("远程弹药兑换失败: 机器人未处于脱战状态")
+		return
+	}
+
+	// 增加弹药数量
+	gs.dynamicRemainingAmmo += param
+
+	// 重置脱战状态 (远程补给后需要重新计算脱战时间)
+	gs.dynamicIsOutOfCombat = false
+	gs.dynamicOutOfCombatCountdown = 0
+
+	if gs.outOfCombatCountdownTicker != nil {
+		gs.outOfCombatCountdownTicker.Stop()
+		gs.outOfCombatCountdownTicker = nil
+	}
+	if gs.outOfCombatCountdownStopChan != nil {
+		close(gs.outOfCombatCountdownStopChan)
+		gs.outOfCombatCountdownStopChan = nil
+	}
+
+	logrus.Infof("远程弹药兑换成功: 补充数量=%d, 剩余弹药=%d",
+		param, gs.dynamicRemainingAmmo)
+
+	// TODO: 发送状态更新消息
+	// gs.publishRobotDynamicStatus()
+}
+
+// processRemoteHealthExchange 处理远程血量兑换
+func (gs *GameSimulator) processRemoteHealthExchange(param uint32) {
+	// 检查是否可以进行远程血量补给
+	if !gs.dynamicCanRemoteHeal {
+		logrus.Warnf("远程血量兑换失败: 当前状态不允许远程血量补给")
+		return
+	}
+
+	// 检查机器人是否存活
+	if gs.staticAliveState != 1 { // 1 = 存活
+		logrus.Warnf("远程血量兑换失败: 机器人未存活 (状态: %d)", gs.staticAliveState)
+		return
+	}
+
+	// 检查是否处于脱战状态
+	if !gs.dynamicIsOutOfCombat {
+		logrus.Warnf("远程血量兑换失败: 机器人未处于脱战状态")
+		return
+	}
+
+	// 恢复血量 (param为恢复的血量点数)
+	healthToAdd := param
+	if gs.dynamicCurrentHealth+healthToAdd > gs.staticMaxHealth {
+		healthToAdd = gs.staticMaxHealth - gs.dynamicCurrentHealth
+	}
+
+	gs.dynamicCurrentHealth += healthToAdd
+
+	// 重置脱战状态 (远程补给后需要重新计算脱战时间)
+	gs.dynamicIsOutOfCombat = false
+	gs.dynamicOutOfCombatCountdown = 0
+
+	if gs.outOfCombatCountdownTicker != nil {
+		gs.outOfCombatCountdownTicker.Stop()
+		gs.outOfCombatCountdownTicker = nil
+	}
+	if gs.outOfCombatCountdownStopChan != nil {
+		close(gs.outOfCombatCountdownStopChan)
+		gs.outOfCombatCountdownStopChan = nil
+	}
+
+	logrus.Infof("远程血量兑换成功: 恢复血量=%d, 当前血量=%d/%d",
+		healthToAdd, gs.dynamicCurrentHealth, gs.staticMaxHealth)
+
+	// TODO: 发送状态更新消息
+	// gs.publishRobotDynamicStatus()
 }
 
 // handleConsoleCommands 处理控制台命令
@@ -4112,15 +3732,6 @@ func (gs *GameSimulator) handleConsoleCommands() {
 	fmt.Println("bullets <ID> <数量>   - 设置机器人子弹数 (ID: 0-13)")
 	fmt.Println("damagered <伤害>      - 设置红方总伤害")
 	fmt.Println("damageblue <伤害>     - 设置蓝方总伤害")
-	fmt.Println("\n敌方单位状态参数:")
-	fmt.Println("enemybase <血量>        - 设置敌方基地血量")
-	fmt.Println("enemybasestatus <状态>  - 设置敌方基地状态")
-	fmt.Println("  0: 无敌  1: 解除无敌,护甲未展开  2: 解除无敌,护甲展开")
-	fmt.Println("enemybaseshield <护盾>  - 设置敌方基地护盾")
-	fmt.Println("enemyoutpost <血量>     - 设置敌方前哨站血量")
-	fmt.Println("enemyoutpoststatus <状态> - 设置敌方前哨站状态")
-	fmt.Println("  0: 无敌  1: 存活装甲旋转  2: 存活装甲停转  3: 被击毁不可重建  4: 被击毁可重建  5: 被击毁重建中")
-	fmt.Println("enemydamage <伤害>      - 设置敌方总伤害")
 	fmt.Println("\nGlobalLogisticsStatus 参数:")
 	fmt.Println("economy <数量>    - 设置剩余经济")
 	fmt.Println("totaleco <数量>   - 设置总获得经济")
@@ -4144,7 +3755,7 @@ func (gs *GameSimulator) handleConsoleCommands() {
 	fmt.Println("respawnfree <0/1>        - 设置是否可以免费复活 (0: 否, 1: 是)")
 	fmt.Println("respawncost <金币>       - 设置复活金币消耗")
 	fmt.Println("respawnpay <0/1>         - 设置是否可以支付复活 (0: 否, 1: 是)")
-	fmt.Println("startrespawn [金币数]     - 开始复活倒计时模拟（不提供则自动计算）")
+	fmt.Println("startrespawn <免费0/1> <付费0/1> - 开始复活倒计时模拟")
 	fmt.Println("stoprespawn              - 停止复活倒计时模拟")
 	fmt.Println("\nRobotInjuryStat 参数:")
 	fmt.Println("injurytotal <伤害>       - 设置总伤害")
@@ -4161,10 +3772,8 @@ func (gs *GameSimulator) handleConsoleCommands() {
 	fmt.Println("staticconn <状态>        - 设置连接状态 (0: 断开, 1: 已连接)")
 	fmt.Println("staticfield <状态>       - 设置场地状态 (0: 场外, 1: 场内)")
 	fmt.Println("staticalive <状态>       - 设置存活状态 (0: 死亡, 1: 存活)")
-	fmt.Println("staticrobotid <ID>       - 设置机器人ID (推荐，自动推断类型和团队)")
-	fmt.Println("  红方ID: 1=英雄 2=工程 3-5=步兵 6=空中 7=哨兵 8=飞镖 9=雷达 10=前哨站 11=基地")
-	fmt.Println("  蓝方ID: 101-111 (对应红方ID+100)")
-	fmt.Println("statictype <类型>        - 设置机器人类型 (不推荐使用，建议用staticrobotid)")
+	fmt.Println("staticrobotid <ID>       - 设置机器人ID")
+	fmt.Println("statictype <类型>        - 设置机器人类型 (1: 英雄, 2: 工程, 3: 步兵, 4: 无人机, 5: 哨兵)")
 	fmt.Println("staticshooter <性能>     - 设置射手性能系统")
 	fmt.Println("staticchassis <性能>     - 设置底盘性能系统")
 	fmt.Println("staticlevel <等级>       - 设置机器人等级")
@@ -4271,7 +3880,7 @@ func (gs *GameSimulator) handleConsoleCommands() {
 	fmt.Println("runereset                   - 重置能量机关状态")
 	fmt.Println("runesync                    - 手动发送RuneStatusSync")
 	fmt.Println("\nstop              - 停止模拟器")
-	fmt.Println("=====================================")
+	fmt.Println("=====================================\n")
 
 	for scanner.Scan() {
 		input := strings.TrimSpace(scanner.Text())
@@ -4306,15 +3915,6 @@ func (gs *GameSimulator) handleConsoleCommands() {
 			fmt.Println("bullets <ID> <数量>   - 设置机器人子弹数 (ID: 0-13)")
 			fmt.Println("damagered <伤害>      - 设置红方总伤害")
 			fmt.Println("damageblue <伤害>     - 设置蓝方总伤害")
-			fmt.Println("\n敌方单位状态参数:")
-			fmt.Println("enemybase <血量>        - 设置敌方基地血量")
-			fmt.Println("enemybasestatus <状态>  - 设置敌方基地状态")
-			fmt.Println("  0: 无敌  1: 解除无敌,护甲未展开  2: 解除无敌,护甲展开")
-			fmt.Println("enemybaseshield <护盾>  - 设置敌方基地护盾")
-			fmt.Println("enemyoutpost <血量>     - 设置敌方前哨站血量")
-			fmt.Println("enemyoutpoststatus <状态> - 设置敌方前哨站状态")
-			fmt.Println("  0: 无敌  1: 存活装甲旋转  2: 存活装甲停转  3: 被击毁不可重建  4: 被击毁可重建  5: 被击毁重建中")
-			fmt.Println("enemydamage <伤害>      - 设置敌方总伤害")
 			fmt.Println("\nGlobalLogisticsStatus 参数:")
 			fmt.Println("economy <数量>    - 设置剩余经济")
 			fmt.Println("totaleco <数量>   - 设置总获得经济")
@@ -4338,7 +3938,7 @@ func (gs *GameSimulator) handleConsoleCommands() {
 			fmt.Println("respawnfree <0/1>        - 设置是否可以免费复活 (0: 否, 1: 是)")
 			fmt.Println("respawncost <金币>       - 设置复活金币消耗")
 			fmt.Println("respawnpay <0/1>         - 设置是否可以支付复活 (0: 否, 1: 是)")
-			fmt.Println("startrespawn [金币数]     - 开始复活倒计时模拟（不提供则自动计算）")
+			fmt.Println("startrespawn <免费0/1> <付费0/1> - 开始复活倒计时模拟")
 			fmt.Println("stoprespawn              - 停止复活倒计时模拟")
 			fmt.Println("\nRobotInjuryStat 参数:")
 			fmt.Println("injurytotal <伤害>       - 设置总伤害")
@@ -4355,10 +3955,8 @@ func (gs *GameSimulator) handleConsoleCommands() {
 			fmt.Println("staticconn <状态>        - 设置连接状态 (0: 断开, 1: 已连接)")
 			fmt.Println("staticfield <状态>       - 设置场地状态 (0: 场外, 1: 场内)")
 			fmt.Println("staticalive <状态>       - 设置存活状态 (0: 死亡, 1: 存活)")
-			fmt.Println("staticrobotid <ID>       - 设置机器人ID (推荐，自动推断类型和团队)")
-			fmt.Println("  红方ID: 1=英雄 2=工程 3-5=步兵 6=空中 7=哨兵 8=飞镖 9=雷达 10=前哨站 11=基地")
-			fmt.Println("  蓝方ID: 101-111 (对应红方ID+100)")
-			fmt.Println("statictype <类型>        - 设置机器人类型 (不推荐使用，建议用staticrobotid)")
+			fmt.Println("staticrobotid <ID>       - 设置机器人ID")
+			fmt.Println("statictype <类型>        - 设置机器人类型 (1: 英雄, 2: 工程, 3: 步兵, 4: 无人机, 5: 哨兵)")
 			fmt.Println("staticshooter <性能>     - 设置射手性能系统")
 			fmt.Println("staticchassis <性能>     - 设置底盘性能系统")
 			fmt.Println("staticlevel <等级>       - 设置机器人等级")
@@ -4469,7 +4067,7 @@ func (gs *GameSimulator) handleConsoleCommands() {
 			fmt.Println("runereset                   - 重置能量机关状态")
 			fmt.Println("runesync                    - 手动发送RuneStatusSync")
 			fmt.Println("\nstop              - 停止模拟器")
-			fmt.Println("=====================================")
+			fmt.Println("=====================================\n")
 
 		case "status":
 			gs.printStatus()
@@ -4705,78 +4303,6 @@ func (gs *GameSimulator) handleConsoleCommands() {
 				continue
 			}
 			gs.setTotalDamageBlue(uint32(damage))
-
-		case "enemybase":
-			if len(parts) < 2 {
-				fmt.Println("用法: enemybase <血量>")
-				continue
-			}
-			health, err := strconv.ParseUint(parts[1], 10, 32)
-			if err != nil {
-				fmt.Printf("无效的敌方基地血量: %s\n", parts[1])
-				continue
-			}
-			gs.setEnemyBaseHealth(uint32(health))
-
-		case "enemybasestatus":
-			if len(parts) < 2 {
-				fmt.Println("用法: enemybasestatus <状态>")
-				continue
-			}
-			status, err := strconv.ParseUint(parts[1], 10, 32)
-			if err != nil {
-				fmt.Printf("无效的敌方基地状态: %s\n", parts[1])
-				continue
-			}
-			gs.setEnemyBaseStatus(uint32(status))
-
-		case "enemybaseshield":
-			if len(parts) < 2 {
-				fmt.Println("用法: enemybaseshield <护盾>")
-				continue
-			}
-			shield, err := strconv.ParseUint(parts[1], 10, 32)
-			if err != nil {
-				fmt.Printf("无效的敌方基地护盾: %s\n", parts[1])
-				continue
-			}
-			gs.setEnemyBaseShield(uint32(shield))
-
-		case "enemyoutpost":
-			if len(parts) < 2 {
-				fmt.Println("用法: enemyoutpost <血量>")
-				continue
-			}
-			health, err := strconv.ParseUint(parts[1], 10, 32)
-			if err != nil {
-				fmt.Printf("无效的敌方前哨站血量: %s\n", parts[1])
-				continue
-			}
-			gs.setEnemyOutpostHealth(uint32(health))
-
-		case "enemyoutpoststatus":
-			if len(parts) < 2 {
-				fmt.Println("用法: enemyoutpoststatus <状态>")
-				continue
-			}
-			status, err := strconv.ParseUint(parts[1], 10, 32)
-			if err != nil {
-				fmt.Printf("无效的敌方前哨站状态: %s\n", parts[1])
-				continue
-			}
-			gs.setEnemyOutpostStatus(uint32(status))
-
-		case "enemydamage":
-			if len(parts) < 2 {
-				fmt.Println("用法: enemydamage <伤害>")
-				continue
-			}
-			damage, err := strconv.ParseUint(parts[1], 10, 32)
-			if err != nil {
-				fmt.Printf("无效的敌方伤害值: %s\n", parts[1])
-				continue
-			}
-			gs.setTotalDamageEnemy(uint32(damage))
 
 		case "powermanager":
 			if len(parts) < 2 {
@@ -5128,7 +4654,7 @@ func (gs *GameSimulator) handleConsoleCommands() {
 
 		case "staticrobotid":
 			if len(parts) < 2 {
-				fmt.Println("用法: staticrobotid <ID> (推荐使用，自动推断类型和团队)")
+				fmt.Println("用法: staticrobotid <ID>")
 				continue
 			}
 			id, err := strconv.ParseUint(parts[1], 10, 32)
@@ -5140,7 +4666,7 @@ func (gs *GameSimulator) handleConsoleCommands() {
 
 		case "statictype":
 			if len(parts) < 2 {
-				fmt.Println("用法: statictype <类型> (不推荐，建议使用staticrobotid)")
+				fmt.Println("用法: statictype <类型>")
 				continue
 			}
 			robotType, err := strconv.ParseUint(parts[1], 10, 32)
@@ -5197,18 +4723,6 @@ func (gs *GameSimulator) handleConsoleCommands() {
 				continue
 			}
 			gs.setStaticMaxHealth(uint32(health))
-
-		case "staticsentry":
-			if len(parts) < 2 {
-				fmt.Println("用法: staticsentry <模式>")
-				continue
-			}
-			mode, err := strconv.ParseUint(parts[1], 10, 32)
-			if err != nil {
-				fmt.Printf("无效的模式值: %s\n", parts[1])
-				continue
-			}
-			gs.setStaticSentryControlMode(uint32(mode))
 
 		case "staticmaxheat":
 			if len(parts) < 2 {
@@ -5491,21 +5005,22 @@ func (gs *GameSimulator) handleConsoleCommands() {
 			fmt.Printf("✓ 已发送Event: ID=%d, Param=%s\n", eventID, param)
 
 		case "startrespawn":
-			var goldCost uint32
-			if len(parts) >= 2 {
-				cost, err := strconv.ParseUint(parts[1], 10, 32)
-				if err != nil {
-					fmt.Printf("无效的金币值: %s\n", parts[1])
-					continue
-				}
-				goldCost = uint32(cost)
-			} else {
-				// 缺省时自动计算
-				goldCost = gs.calculateRespawnGoldCost()
-				fmt.Printf("自动计算复活金币消耗: %d\n", goldCost)
+			if len(parts) < 3 {
+				fmt.Println("用法: startrespawn <免费0/1> <付费0/1>")
+				continue
 			}
-			gs.startRespawnSimulation(goldCost)
-			fmt.Printf("✓ 已开始复活倒计时模拟 (金币消耗: %d)\n", goldCost)
+			canFree, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的免费复活值: %s\n", parts[1])
+				continue
+			}
+			canPay, err := strconv.ParseUint(parts[2], 10, 32)
+			if err != nil {
+				fmt.Printf("无效的付费复活值: %s\n", parts[2])
+				continue
+			}
+			gs.startRespawnSimulation(canFree != 0, canPay != 0)
+			fmt.Printf("✓ 已开始复活倒计时模拟 (免费复活: %v, 金币复活: %v)\n", canFree != 0, canPay != 0)
 
 		case "stoprespawn":
 			gs.stopRespawnSimulation()
@@ -5874,7 +5389,7 @@ func (gs *GameSimulator) handleConsoleCommands() {
 					fmt.Printf("预计切换完成: %.1f 秒后\n", 1.0-elapsed)
 				}
 			}
-			fmt.Println("==================================")
+			fmt.Println("==================================\n")
 
 		case "assemblystatus":
 			gs.mu.RLock()
@@ -5906,7 +5421,7 @@ func (gs *GameSimulator) handleConsoleCommands() {
 			if gs.assemblyState != 0 {
 				fmt.Printf("当前状态耗时: %.1f 秒\n", elapsed)
 			}
-			fmt.Println("==================================")
+			fmt.Println("==================================\n")
 
 		case "assemblymax":
 			if len(parts) < 2 {
@@ -6023,7 +5538,7 @@ func (gs *GameSimulator) handleConsoleCommands() {
 			fmt.Printf("免费时间: %d 秒\n", freeTime)
 			fmt.Printf("已消耗金币: %d\n", costCoins)
 			fmt.Printf("剩余经济: %d (可用于付费空中支援)\n", remainingEconomy)
-			fmt.Println("==================================")
+			fmt.Println("==================================\n")
 
 		case "airsupportfree":
 			if len(parts) < 2 {
@@ -6656,208 +6171,4 @@ func Publish(simulator *GameSimulator) {
 			// 不自动退出，等待用户命令
 		}
 	}
-}
-
-// ==================== 弹药兑换和Buff系统 ====================
-
-// publishAmmoExchangeUpdate 发布弹药兑换后的状态更新
-func (gs *GameSimulator) publishAmmoExchangeUpdate() {
-	// 发送RobotDynamicStatus以更新剩余弹药信息
-	dynamicStatus := gs.getRobotDynamicStatus()
-	out, err := proto.Marshal(dynamicStatus)
-	if err != nil {
-		logrus.Errorf("序列化 RobotDynamicStatus 失败: %v", err)
-		return
-	}
-
-	err = server.Publish("RobotDynamicStatus", out, false, 0)
-	if err != nil {
-		logrus.Errorf("发布 RobotDynamicStatus 失败: %v", err)
-		return
-	}
-
-	// 发送可兑换发弹量限制Buff
-	gs.publishAmmoExchangeBuff()
-}
-
-// publishAmmoExchangeBuff 发布可兑换发弹量限制的Buff消息
-func (gs *GameSimulator) publishAmmoExchangeBuff() {
-	// 计算剩余可兑换弹药数量
-	gs.mu.Lock()
-
-	// 17mm弹药剩余可兑换量
-	var remaining17mm uint32
-	remaining17mm = Max17mmAmmoPerMatch - gs.perMatchNonRemote17mmAmmoExchanged - gs.perMatchRemote17mmAmmoExchanged
-	if remaining17mm > Max17mmAmmoPerMatch {
-		remaining17mm = 0
-	}
-
-	// 42mm弹药剩余可兑换量 (仅英雄和哨兵)
-	var remaining42mm uint32
-	robotType := gs.getCurrentRobotType()
-	if robotType == 1 || robotType == 7 { // 1=英雄, 7=哨兵
-		remaining42mm = Max42mmAmmoPerMatch - gs.perMatchNonRemote42mmAmmoExchanged - gs.perMatchRemote42mmAmmoExchanged
-		if remaining42mm > Max42mmAmmoPerMatch {
-			remaining42mm = 0
-		}
-	}
-
-	robotId := gs.staticRobotId
-	gs.mu.Unlock()
-
-	// 发送17mm可兑换发弹量Buff
-	if remaining17mm > 0 {
-		buff17mm := &rmcp.Buff{
-			RobotId:      robotId,
-			BuffType:     6,                    // 可兑换发弹量
-			BuffLevel:    int32(remaining17mm), // 剩余可兑换数量
-			BuffMaxTime:  0,                    // 永久有效直到刷新
-			BuffLeftTime: 0,
-			MsgParams:    "17mm",
-		}
-
-		out, err := proto.Marshal(buff17mm)
-		if err != nil {
-			logrus.Errorf("序列化 17mm弹药Buff 失败: %v", err)
-		} else {
-			server.Publish("Buff", out, false, 0)
-			logrus.Infof("已发送 17mm 可兑换发弹量Buff: 剩余=%d发", remaining17mm)
-		}
-	}
-
-	// 发送42mm可兑换发弹量Buff (仅英雄和哨兵)
-	if remaining42mm > 0 && (robotType == 1 || robotType == 7) { // 1=英雄, 7=哨兵
-		buff42mm := &rmcp.Buff{
-			RobotId:      robotId,
-			BuffType:     6,                    // 可兑换发弹量
-			BuffLevel:    int32(remaining42mm), // 剩余可兑换数量
-			BuffMaxTime:  0,                    // 永久有效直到刷新
-			BuffLeftTime: 0,
-			MsgParams:    "42mm",
-		}
-
-		out, err := proto.Marshal(buff42mm)
-		if err != nil {
-			logrus.Errorf("序列化 42mm弹药Buff 失败: %v", err)
-		} else {
-			server.Publish("Buff", out, false, 0)
-			logrus.Infof("已发送 42mm 可兑换发弹量Buff: 剩余=%d发", remaining42mm)
-		}
-	}
-
-	// 如果无可兑换弹药，发送空Buff
-	if remaining17mm == 0 && (remaining42mm == 0 || (robotType != 1 && robotType != 7)) { // 1=英雄, 7=哨兵
-		buffEmpty := &rmcp.Buff{
-			RobotId:      robotId,
-			BuffType:     6, // 可兑换发弹量
-			BuffLevel:    0, // 无可兑换
-			BuffMaxTime:  0,
-			BuffLeftTime: 0,
-			MsgParams:    "none",
-		}
-
-		out, err := proto.Marshal(buffEmpty)
-		if err != nil {
-			logrus.Errorf("序列化 空弹药Buff 失败: %v", err)
-		} else {
-			server.Publish("Buff", out, false, 0)
-			logrus.Infof("已发送 空可兑换发弹量Buff: 无可兑换弹药")
-		}
-	}
-}
-
-// publishInitialAmmoExchangeBuff 发布初始可兑换发弹量Buff (在比赛开始时调用)
-func (gs *GameSimulator) publishInitialAmmoExchangeBuff() {
-	logrus.Info("发布初始可兑换发弹量Buff")
-	gs.publishAmmoExchangeBuff()
-}
-
-// publishHealthRestoreUpdate 发布血量恢复后的状态更新
-func (gs *GameSimulator) publishHealthRestoreUpdate() {
-	gs.mu.Lock()
-	defer gs.mu.Unlock()
-	gs.publishHealthRestoreUpdateUnsafe()
-}
-
-// publishHealthRestoreUpdateUnsafe 发布血量恢复后的状态更新（不加锁版本）
-func (gs *GameSimulator) publishHealthRestoreUpdateUnsafe() {
-	// 检查MQTT服务器是否已初始化
-	if server == nil {
-		logrus.Warn("MQTT服务器未初始化，跳过状态更新发布")
-		return
-	}
-
-	// 直接读取值，避免额外的锁操作
-	currentHealth := gs.dynamicCurrentHealth
-	currentHeat := gs.dynamicCurrentHeat
-	lastFireRate := gs.dynamicLastProjectileFireRate
-	currentChassisEnergy := gs.dynamicCurrentChassisEnergy
-	currentBufferEnergy := gs.dynamicCurrentBufferEnergy
-	currentExperience := gs.dynamicCurrentExperience
-	experienceForUpgrade := gs.dynamicExperienceForUpgrade
-	totalFired := gs.dynamicTotalProjectilesFired
-	remainingAmmo := gs.dynamicRemainingAmmo
-	isOutOfCombat := gs.dynamicIsOutOfCombat
-	outOfCombatCountdown := gs.dynamicOutOfCombatCountdown
-	canRemoteHeal := gs.dynamicCanRemoteHeal
-	canRemoteAmmo := gs.dynamicCanRemoteAmmo
-
-	// 创建RobotDynamicStatus
-	dynamicStatus := &rmcp.RobotDynamicStatus{
-		CurrentHealth:          currentHealth,
-		CurrentHeat:            currentHeat,
-		LastProjectileFireRate: lastFireRate,
-		CurrentChassisEnergy:   currentChassisEnergy,
-		CurrentBufferEnergy:    currentBufferEnergy,
-		CurrentExperience:      currentExperience,
-		ExperienceForUpgrade:   experienceForUpgrade,
-		TotalProjectilesFired:  totalFired,
-		RemainingAmmo:          remainingAmmo,
-		IsOutOfCombat:          isOutOfCombat,
-		OutOfCombatCountdown:   outOfCombatCountdown,
-		CanRemoteHeal:          canRemoteHeal,
-		CanRemoteAmmo:          canRemoteAmmo,
-	}
-
-	// 发送RobotDynamicStatus以更新血量信息
-	out, err := proto.Marshal(dynamicStatus)
-	if err != nil {
-		logrus.Errorf("序列化RobotDynamicStatus失败: %v", err)
-		return
-	}
-
-	err = server.Publish("RobotDynamicStatus", out, false, 0)
-	if err != nil {
-		logrus.Errorf("发布RobotDynamicStatus失败: %v", err)
-		return
-	}
-
-	// 直接读取值，避免额外的锁操作
-	remainingEconomy := gs.remainingEconomy
-	totalEconomyObtained := gs.totalEconomyObtained
-	techLevel := gs.techLevel
-	encryptionLevel := gs.encryptionLevel
-
-	// 创建GlobalLogisticsStatus
-	logisticsStatus := &rmcp.GlobalLogisticsStatus{
-		RemainingEconomy:     remainingEconomy,
-		TotalEconomyObtained: totalEconomyObtained,
-		TechLevel:            techLevel,
-		EncryptionLevel:      encryptionLevel,
-	}
-
-	// 发送GlobalLogisticsStatus以更新经济状态
-	out, err = proto.Marshal(logisticsStatus)
-	if err != nil {
-		logrus.Errorf("序列化GlobalLogisticsStatus失败: %v", err)
-		return
-	}
-
-	err = server.Publish("GlobalLogisticsStatus", out, false, 0)
-	if err != nil {
-		logrus.Errorf("发布GlobalLogisticsStatus失败: %v", err)
-		return
-	}
-
-	logrus.Infof("已发送远程血量恢复后的状态更新")
 }
